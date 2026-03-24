@@ -1,0 +1,23 @@
+// RADE Build Configuration
+// This file sets the header search paths and preprocessor macros
+// needed for the RADE C library and Opus (FARGAN/LPCNet) to compile.
+
+// --- Device builds: full C library + libopus ---
+HEADER_SEARCH_PATHS = $(inherited) $(SRCROOT)/Libraries/radae $(SRCROOT)/Libraries/opus/dnn $(SRCROOT)/Libraries/opus/celt $(SRCROOT)/Libraries/opus/include $(SRCROOT)/Libraries/opus $(SRCROOT)/Libraries/eoo
+LIBRARY_SEARCH_PATHS = $(inherited) $(SRCROOT)/Libraries/opus/lib
+OTHER_LDFLAGS = $(inherited) -lopus
+GCC_PREPROCESSOR_DEFINITIONS = $(inherited) IS_BUILDING_RADE_API=1 RADE_PYTHON_FREE=1 HAVE_CONFIG_H=1 USE_LIBOPUS=1
+
+// --- Simulator builds: exclude C sources and libopus (no arm64-simulator .a) ---
+EXCLUDED_SOURCE_FILE_NAMES[sdk=iphonesimulator*] = rade_all.c rade_nnet.c EooCallsignCodec.cpp eoo_callsign_codec_c.cpp
+OTHER_LDFLAGS[sdk=iphonesimulator*] = $(inherited)
+LIBRARY_SEARCH_PATHS[sdk=iphonesimulator*] = $(inherited)
+GCC_PREPROCESSOR_DEFINITIONS[sdk=iphonesimulator*] = $(inherited) FREEDV_SIMULATOR_STUB=1
+
+SWIFT_OBJC_BRIDGING_HEADER = $(SRCROOT)/FreeDV/Bridge/FreeDV-Bridging-Header.h
+
+// Microphone permission is required for RX/TX audio
+INFOPLIST_KEY_NSMicrophoneUsageDescription = FreeDV needs microphone access for radio transceiver audio processing.
+
+// libopus.a is currently arm64 only; exclude x86_64 to avoid linker errors
+EXCLUDED_ARCHS = x86_64

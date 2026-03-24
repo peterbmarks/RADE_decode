@@ -1,0 +1,15 @@
+# Xcode
+build/
+DerivedData/
+*.xcuserdata
+*.xcworkspace
+!*.xcodeproj/xcshareddata/
+
+# macOS
+.DS_Store
+*.swp
+*~
+
+# Secrets
+.env
+credentials.json
