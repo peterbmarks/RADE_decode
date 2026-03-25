@@ -46,6 +46,9 @@ class AudioManager: ObservableObject {
     @Published var freqOffset: Float = 0
     @Published var inputLevel: Float = -60
     @Published var outputLevel: Float = -60
+    @Published var deferredDecodeInProgress = false
+    @Published var deferredDecodeProgress: Double = 0
+    @Published var deferredDecodeStatusText = ""
     
     // FFT spectrum data (dB magnitude, 512 bins covering 0-4kHz at 8kHz sample rate)
     @Published var fftData: [Float] = Array(repeating: -100, count: 512)
@@ -94,6 +97,8 @@ class AudioManager: ObservableObject {
     // Reception logging
     var receptionLogger: ReceptionLogger?
     var wavRecorder: WAVRecorder?
+    private let deferredSampleStore = DeferredSampleStore()
+    private var backgroundRawSampleCaptureEnabled = false
     var isRecordingEnabled: Bool {
         UserDefaults.standard.object(forKey: "autoRecordEnabled") as? Bool ?? true
     }
@@ -129,8 +134,9 @@ class AudioManager: ObservableObject {
     private var droppedProcessingChunks = 0
     /// Last observed modem sync status, used by background throttle policy.
     private var isModemSyncedForBackground = false
-    /// Background decode base stride. Adaptive logic raises this under load.
-    private let backgroundDecodeBaseStride = 1
+    /// Event-driven background boost window for sync acquisition.
+    private var backgroundDecodeBoostUntil: Date?
+    private let backgroundDecodeBoostDuration: TimeInterval = 12
     private var backgroundChunkCounter = 0
     
     /// Flag to signal processingQueue to skip work during shutdown
@@ -197,6 +203,10 @@ class AudioManager: ObservableObject {
         radeWrapper.speechSynthesisEnabled = !enabled
     }
 
+    func setBackgroundRawSampleCaptureEnabled(_ enabled: Bool) {
+        backgroundRawSampleCaptureEnabled = enabled
+    }
+
     func setDeferredFeatureStorageEnabled(_ enabled: Bool) {
         radeWrapper.deferredFeatureStorageEnabled = enabled
     }
@@ -211,6 +221,51 @@ class AudioManager: ObservableObject {
         }
     }
 
+    func resetDeferredSamples() {
+        processingQueue.async { [weak self] in
+            self?.deferredSampleStore.reset()
+        }
+    }
+
+    func decodeDeferredSamples(chunkSamples: Int = 800) {
+        processingQueue.async { [weak self] in
+            guard let self = self else { return }
+            let totalSamples = self.deferredSampleStore.totalSampleCount()
+            guard totalSamples > 0 else {
+                DispatchQueue.main.async {
+                    self.deferredDecodeInProgress = false
+                    self.deferredDecodeProgress = 0
+                    self.deferredDecodeStatusText = ""
+                }
+                return
+            }
+
+            DispatchQueue.main.async {
+                self.deferredDecodeInProgress = true
+                self.deferredDecodeProgress = 0
+                self.deferredDecodeStatusText = "Decoding background capture..."
+            }
+
+            self.deferredSampleStore.drain(chunkSamples: chunkSamples, process: { samples in
+                samples.withUnsafeBufferPointer { buf in
+                    guard let ptr = buf.baseAddress else { return }
+                    self.radeWrapper.rxProcessInputSamples(ptr, count: Int32(samples.count))
+                }
+            }, onProgress: { processedSamples in
+                let progress = min(1.0, Double(processedSamples) / Double(totalSamples))
+                DispatchQueue.main.async {
+                    self.deferredDecodeProgress = progress
+                }
+            })
+
+            DispatchQueue.main.async {
+                self.deferredDecodeProgress = 1.0
+                self.deferredDecodeInProgress = false
+                self.deferredDecodeStatusText = ""
+            }
+        }
+    }
+
     func resetBackgroundHeartbeat() {
         processingQueue.sync {
             backgroundUpdateCounter = 0
@@ -219,6 +274,7 @@ class AudioManager: ObservableObject {
             backgroundRxChunkCount = 0
             backgroundRxChunkLastDate = nil
             isModemSyncedForBackground = false
+            backgroundDecodeBoostUntil = nil
         }
     }
 
@@ -417,6 +473,7 @@ class AudioManager: ObservableObject {
                 let pending = self.pendingProcessingChunks
                 let dropped = self.droppedProcessingChunks
                 let isSynced = self.isModemSyncedForBackground
+                let boost = self.backgroundDecodeBoostUntil.map { Date() < $0 } ?? false
                 self.processingBackpressureLock.unlock()
                 let loadLevel: Int
                 if pending >= 5 {
@@ -426,7 +483,7 @@ class AudioManager: ObservableObject {
                 } else {
                     loadLevel = 1
                 }
-                bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped) load=\(loadLevel) synced=\(isSynced)")
+                bgLog("Health tick: engine=\(engineRunning) pending=\(pending) dropped=\(dropped) load=\(loadLevel) synced=\(isSynced) boost=\(boost)")
             }
             if !engineRunning {
                 bgLog("Health check: engine NOT running — restarting")
@@ -584,6 +641,11 @@ class AudioManager: ObservableObject {
             let isSynced = syncState == 2
             self.processingBackpressureLock.lock()
             self.isModemSyncedForBackground = isSynced
+            if isSynced {
+                self.backgroundDecodeBoostUntil = Date().addingTimeInterval(self.backgroundDecodeBoostDuration)
+            } else if syncState == 1 || snr >= 4 {
+                self.backgroundDecodeBoostUntil = Date().addingTimeInterval(self.backgroundDecodeBoostDuration)
+            }
             self.processingBackpressureLock.unlock()
             
             // Session lifecycle with grace period for brief sync drops
@@ -811,7 +873,9 @@ class AudioManager: ObservableObject {
         droppedProcessingChunks = 0
         backgroundChunkCounter = 0
         isModemSyncedForBackground = false
+        backgroundDecodeBoostUntil = nil
         processingBackpressureLock.unlock()
+        deferredSampleStore.reset()
         installInputTapIfNeeded(with: inputFormat)
         
         do {
@@ -843,12 +907,15 @@ class AudioManager: ObservableObject {
         // Signal processingQueue to skip pending work items immediately
         shouldProcess = false
         setDeferredFeatureStorageEnabled(false)
+        backgroundRawSampleCaptureEnabled = false
         processingBackpressureLock.lock()
         pendingProcessingChunks = 0
         droppedProcessingChunks = 0
         backgroundChunkCounter = 0
         isModemSyncedForBackground = false
+        backgroundDecodeBoostUntil = nil
         processingBackpressureLock.unlock()
+        deferredSampleStore.reset()
         
         // Stop health monitoring
         stopHealthCheckTimer()
@@ -1017,6 +1084,12 @@ class AudioManager: ObservableObject {
                 }
             }
         }
+
+        // Background low-load mode: store raw modem-band samples and defer decode.
+        if backgroundMode && backgroundRawSampleCaptureEnabled {
+            deferredSampleStore.appendRawInt16(samples, count: convertedCount)
+            return
+        }
         
         // RADE processing (may take 10-50ms per chunk due to neural network).
         // Apply queue backpressure so background does not accumulate unlimited chunks.
@@ -1026,8 +1099,21 @@ class AudioManager: ObservableObject {
         if backgroundMode {
             effectiveMaxPending = maxPendingProcessingChunksInBackground
             let isSynced = isModemSyncedForBackground
+            let isBoostActive: Bool
+            if let until = backgroundDecodeBoostUntil {
+                isBoostActive = Date() < until
+            } else {
+                isBoostActive = false
+            }
             let adaptiveStride: Int
-            if isSynced {
+            if !isSynced && isBoostActive {
+                // Event-driven acquisition boost (candidate / elevated SNR seen).
+                if pendingProcessingChunks >= 2 {
+                    adaptiveStride = 2
+                } else {
+                    adaptiveStride = 1
+                }
+            } else if isSynced {
                 // Synced: prioritize continuity while still applying backpressure.
                 if pendingProcessingChunks >= 2 {
                     adaptiveStride = 3
@@ -1036,7 +1122,7 @@ class AudioManager: ObservableObject {
                 } else {
                     adaptiveStride = 1
                 }
-            } else if pendingProcessingChunks >= 0 {
+            } else {
                 // Unsynced/searching: aggressive throttling to protect background survival.
                 if pendingProcessingChunks >= 2 {
                     adaptiveStride = 8
@@ -1045,8 +1131,6 @@ class AudioManager: ObservableObject {
                 } else {
                     adaptiveStride = 2
                 }
-            } else {
-                adaptiveStride = backgroundDecodeBaseStride
             }
             backgroundChunkCounter += 1
             if backgroundChunkCounter % adaptiveStride != 0 {

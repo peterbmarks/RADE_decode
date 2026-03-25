@@ -64,6 +64,9 @@ class TransceiverViewModel: ObservableObject {
     // Background decode health indicator
     @Published var backgroundHealthText: String = ""
     @Published var backgroundHealthIsHealthy: Bool = false
+    @Published var deferredDecodeInProgress = false
+    @Published var deferredDecodeProgress: Double = 0
+    @Published var deferredDecodeStatusText = ""
     
     private var statusTimer: Timer?
     private let maxWaterfallRows = 100
@@ -165,6 +168,9 @@ class TransceiverViewModel: ObservableObject {
                     self.currentOutputDevice = self.deviceManager.currentOutputName
                 }
                 self.isRecording = self.audioManager.wavRecorder != nil
+                self.deferredDecodeInProgress = self.audioManager.deferredDecodeInProgress
+                self.deferredDecodeProgress = self.audioManager.deferredDecodeProgress
+                self.deferredDecodeStatusText = self.audioManager.deferredDecodeStatusText
                 
                 // Update decoded callsign from EOO + haptic on new callsign
                 let newCallsign = self.audioManager.decodedCallsign
@@ -202,6 +208,7 @@ class TransceiverViewModel: ObservableObject {
         backgroundEnterTime = nil
         audioManager.resetBackgroundHeartbeat()
         audioManager.resetDeferredFeatures()
+        audioManager.resetDeferredSamples()
 
         audioManager.startRX()
         // Start Live Activity with current reporter frequency
@@ -261,11 +268,12 @@ class TransceiverViewModel: ObservableObject {
 
         // Disable FFT and waterfall — no one can see them in background
         audioManager.fftEnabled = false
-        // Tell AudioManager and LogManager to skip non-essential main thread dispatches
-        // Background strategy: decode + store feature frames only (no synthesis).
+        // Tell AudioManager and LogManager to skip non-essential main thread dispatches.
+        // Background strategy: capture raw modem samples; decode on foreground.
         audioManager.backgroundMode = true
         audioManager.setBackgroundDecodeOnly(true)
-        audioManager.setDeferredFeatureStorageEnabled(true)
+        audioManager.setDeferredFeatureStorageEnabled(false)
+        audioManager.setBackgroundRawSampleCaptureEnabled(true)
         LogManager.shared.backgroundMode = true
         // Stop the UI timer entirely — no SwiftUI updates needed in background.
         // Live Activity updates come from AudioManager's background callback instead.
@@ -322,12 +330,13 @@ class TransceiverViewModel: ObservableObject {
         // Remove background callback
         audioManager.onBackgroundStatusUpdate = nil
         audioManager.backgroundMode = false
+        audioManager.setBackgroundRawSampleCaptureEnabled(false)
         audioManager.setDeferredFeatureStorageEnabled(false)
         audioManager.setBackgroundDecodeOnly(false)
         LogManager.shared.backgroundMode = false
 
-        // Foreground: synthesize deferred background features into session audio log.
-        audioManager.synthesizeDeferredFeatures()
+        // Foreground: decode deferred background raw samples into session audio log.
+        audioManager.decodeDeferredSamples()
         
         #if os(iOS)
         // Ensure no transition task is left running.

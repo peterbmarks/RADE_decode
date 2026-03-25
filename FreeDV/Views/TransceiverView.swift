@@ -42,6 +42,12 @@ struct TransceiverView: View {
                         }
                         .padding(.horizontal, 16)
                         .padding(.top, 4)
+
+                        if viewModel.deferredDecodeInProgress {
+                            DeferredDecodeProgressCard(viewModel: viewModel)
+                                .padding(.horizontal, 16)
+                                .padding(.top, 8)
+                        }
                         
                         // Spectrum + Waterfall stacked display (hidden in ultraLow)
                         if powerManager.fftEnabled {
@@ -301,6 +307,42 @@ struct BackgroundHintLabel: View {
                     .lineLimit(1)
             }
         }
+    }
+}
+
+// MARK: - Deferred Decode Progress
+
+struct DeferredDecodeProgressCard: View {
+    @ObservedObject var viewModel: TransceiverViewModel
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Image(systemName: "tray.and.arrow.down.fill")
+                    .font(.system(size: 11))
+                    .foregroundStyle(.blue)
+                Text(viewModel.deferredDecodeStatusText.isEmpty
+                     ? "Decoding Background Capture"
+                     : viewModel.deferredDecodeStatusText)
+                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
+                    .foregroundStyle(.primary)
+                Spacer()
+                Text(String(format: "%.0f%%", viewModel.deferredDecodeProgress * 100))
+                    .font(.system(size: 11, weight: .bold, design: .monospaced))
+                    .foregroundStyle(.secondary)
+            }
+
+            ProgressView(value: viewModel.deferredDecodeProgress)
+                .tint(.blue)
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 8)
+        .background(Color.white.opacity(0.04))
+        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .overlay(
+            RoundedRectangle(cornerRadius: 6)
+                .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+        )
     }
 }
 
