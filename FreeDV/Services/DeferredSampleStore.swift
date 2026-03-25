@@ -49,7 +49,13 @@ final class DeferredSampleStore {
         return Int(bytes / UInt64(MemoryLayout<Int16>.size))
     }
 
-    func drain(chunkSamples: Int, process: ([Int16]) -> Void, onProgress: ((Int) -> Void)? = nil) {
+    func drain(
+        chunkSamples: Int,
+        process: ([Int16]) -> Void,
+        onProgress: ((Int) -> Void)? = nil,
+        shouldContinue: (() -> Bool)? = nil,
+        removeFileWhenDone: Bool = true
+    ) {
         guard chunkSamples > 0 else { return }
         guard fileManager.fileExists(atPath: fileURL.path) else { return }
 
@@ -59,13 +65,18 @@ final class DeferredSampleStore {
         guard let reader = try? FileHandle(forReadingFrom: fileURL) else { return }
         defer {
             try? reader.close()
-            try? fileManager.removeItem(at: fileURL)
+            if removeFileWhenDone {
+                try? fileManager.removeItem(at: fileURL)
+            }
         }
 
         let chunkBytes = chunkSamples * MemoryLayout<Int16>.size
         var processedSamples = 0
 
         while true {
+            if let shouldContinue = shouldContinue, !shouldContinue() {
+                break
+            }
             guard let chunk = try? reader.read(upToCount: chunkBytes), !chunk.isEmpty else {
                 break
             }
@@ -80,6 +91,10 @@ final class DeferredSampleStore {
             process(values)
             processedSamples += values.count
             onProgress?(processedSamples)
+
+            if let shouldContinue = shouldContinue, !shouldContinue() {
+                break
+            }
 
             if usableBytes < chunkBytes {
                 break

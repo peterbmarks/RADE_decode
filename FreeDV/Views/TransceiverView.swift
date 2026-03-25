@@ -334,6 +334,26 @@ struct DeferredDecodeProgressCard: View {
 
             ProgressView(value: viewModel.deferredDecodeProgress)
                 .tint(.blue)
+
+            HStack(spacing: 10) {
+                Text("Scanned \(formatTime(viewModel.deferredDecodeScannedSeconds))")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Text("ETA \(formatTime(viewModel.deferredDecodeETASeconds))")
+                    .font(.system(size: 10, design: .monospaced))
+                    .foregroundStyle(.secondary)
+                Spacer()
+                Button(action: { viewModel.toggleDeferredDecodePause() }) {
+                    Label(viewModel.deferredDecodePaused ? "Resume" : "Pause",
+                          systemImage: viewModel.deferredDecodePaused ? "play.fill" : "pause.fill")
+                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                        .padding(.horizontal, 8)
+                        .padding(.vertical, 4)
+                        .background(Color.white.opacity(0.08))
+                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                }
+                .buttonStyle(.plain)
+            }
         }
         .padding(.horizontal, 10)
         .padding(.vertical, 8)
@@ -343,6 +363,13 @@ struct DeferredDecodeProgressCard: View {
             RoundedRectangle(cornerRadius: 6)
                 .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
         )
+    }
+
+    private func formatTime(_ seconds: Double) -> String {
+        let s = max(0, Int(seconds.rounded()))
+        let m = s / 60
+        let r = s % 60
+        return String(format: "%02d:%02d", m, r)
     }
 }
 

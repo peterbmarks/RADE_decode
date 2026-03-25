@@ -30,6 +30,7 @@ class RADEWrapper {
     var onCallsignDecoded: ((_ callsign: String?) -> Void)?
     var speechSynthesisEnabled = true
     var deferredFeatureStorageEnabled = false
+    var rxDiagnosticLoggingEnabled = true
     var onModemFrameProcessed: ((_ snr: Float, _ freqOffset: Float, _ syncState: Int, _ nin: Int) -> Void)?
 
     init() {
@@ -118,6 +119,8 @@ class RADEWrapper {
     var speechSynthesisEnabled = true
     /// Store decoded feature frames to disk while in background.
     var deferredFeatureStorageEnabled = false
+    /// Enable/disable per-frame RX diagnostic logs.
+    var rxDiagnosticLoggingEnabled = true
     
     /// Called after each rade_rx() call with data for reception logging.
     /// Parameters: (snr, freqOffset, syncState, nin, hasEoo, callsign)
@@ -223,7 +226,7 @@ class RADEWrapper {
             
             // Periodic diagnostic log (every ~1 second, ~8 calls at 120ms modem frames)
             rxCallCount += 1
-            if rxCallCount % 8 == 0 {
+            if rxDiagnosticLoggingEnabled && rxCallCount % 8 == 0 {
                 let peakDB = 20 * log10(max(peakSample, 1e-10))
                 appLog("RADE RX: sync=\(syncVal) snr=\(status.snr)dB fOff=\(String(format: "%.1f", status.freqOffset))Hz peak=\(String(format: "%.1f", peakDB))dBFS nin=\(nin) feat=\(nFeatOut) buf=\(rxInputBuffer.count)")
             }

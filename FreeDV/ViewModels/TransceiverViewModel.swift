@@ -67,6 +67,9 @@ class TransceiverViewModel: ObservableObject {
     @Published var deferredDecodeInProgress = false
     @Published var deferredDecodeProgress: Double = 0
     @Published var deferredDecodeStatusText = ""
+    @Published var deferredDecodePaused = false
+    @Published var deferredDecodeScannedSeconds: Double = 0
+    @Published var deferredDecodeETASeconds: Double = 0
     
     private var statusTimer: Timer?
     private let maxWaterfallRows = 100
@@ -171,6 +174,9 @@ class TransceiverViewModel: ObservableObject {
                 self.deferredDecodeInProgress = self.audioManager.deferredDecodeInProgress
                 self.deferredDecodeProgress = self.audioManager.deferredDecodeProgress
                 self.deferredDecodeStatusText = self.audioManager.deferredDecodeStatusText
+                self.deferredDecodePaused = self.audioManager.deferredDecodePaused
+                self.deferredDecodeScannedSeconds = self.audioManager.deferredDecodeScannedSeconds
+                self.deferredDecodeETASeconds = self.audioManager.deferredDecodeETASeconds
                 
                 // Update decoded callsign from EOO + haptic on new callsign
                 let newCallsign = self.audioManager.decodedCallsign
@@ -200,6 +206,10 @@ class TransceiverViewModel: ObservableObject {
         } else {
             startTransceiver()
         }
+    }
+
+    func toggleDeferredDecodePause() {
+        audioManager.setDeferredDecodePaused(!deferredDecodePaused)
     }
     
     func startTransceiver() {
@@ -274,6 +284,7 @@ class TransceiverViewModel: ObservableObject {
         audioManager.setBackgroundDecodeOnly(true)
         audioManager.setDeferredFeatureStorageEnabled(false)
         audioManager.setBackgroundRawSampleCaptureEnabled(true)
+        audioManager.setDeferredDecodePaused(true)
         LogManager.shared.backgroundMode = true
         // Stop the UI timer entirely — no SwiftUI updates needed in background.
         // Live Activity updates come from AudioManager's background callback instead.
@@ -333,6 +344,7 @@ class TransceiverViewModel: ObservableObject {
         audioManager.setBackgroundRawSampleCaptureEnabled(false)
         audioManager.setDeferredFeatureStorageEnabled(false)
         audioManager.setBackgroundDecodeOnly(false)
+        audioManager.setDeferredDecodePaused(false)
         LogManager.shared.backgroundMode = false
 
         // Foreground: decode deferred background raw samples into session audio log.

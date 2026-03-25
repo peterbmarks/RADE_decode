@@ -49,6 +49,9 @@ class AudioManager: ObservableObject {
     @Published var deferredDecodeInProgress = false
     @Published var deferredDecodeProgress: Double = 0
     @Published var deferredDecodeStatusText = ""
+    @Published var deferredDecodePaused = false
+    @Published var deferredDecodeScannedSeconds: Double = 0
+    @Published var deferredDecodeETASeconds: Double = 0
     
     // FFT spectrum data (dB magnitude, 512 bins covering 0-4kHz at 8kHz sample rate)
     @Published var fftData: [Float] = Array(repeating: -100, count: 512)
@@ -124,8 +127,18 @@ class AudioManager: ObservableObject {
     // .userInitiated keeps processing near real-time for responsive sync display.
     private let processingQueue = DispatchQueue(label: "com.freedv.rade.processing",
                                                  qos: .userInitiated)
+    // Deferred replay queue runs at lower priority to keep foreground UI responsive.
+    private let deferredDecodeQueue = DispatchQueue(label: "com.freedv.rade.deferredDecode",
+                                                    qos: .userInitiated)
     /// Separate queue for FFT so it's not blocked by RADE neural network processing.
     private let fftQueue = DispatchQueue(label: "com.freedv.fft", qos: .default)
+    private let deferredDecodeControlLock = NSLock()
+    private var deferredDecodePauseRequested = false
+    private var deferredDecodeCancelRequested = false
+    private var deferredDecodeActive = false
+    private var deferredReplayFastMode = false
+    private let realtimeDecodeControlLock = NSLock()
+    private var realtimeDecodePaused = false
     /// Backpressure gate for RX processing queue to prevent unbounded task buildup.
     private let processingBackpressureLock = NSLock()
     private var pendingProcessingChunks = 0
@@ -227,41 +240,188 @@ class AudioManager: ObservableObject {
         }
     }
 
-    func decodeDeferredSamples(chunkSamples: Int = 800) {
-        processingQueue.async { [weak self] in
+    func setDeferredDecodePaused(_ paused: Bool) {
+        deferredDecodeControlLock.lock()
+        guard deferredDecodeActive else {
+            deferredDecodeControlLock.unlock()
+            return
+        }
+        deferredDecodePauseRequested = paused
+        deferredDecodeControlLock.unlock()
+        DispatchQueue.main.async {
+            self.deferredDecodePaused = paused
+            if paused {
+                self.deferredDecodeStatusText = "Paused"
+            } else if self.deferredDecodeInProgress {
+                self.deferredDecodeStatusText = "Decoding background capture..."
+            }
+        }
+    }
+
+    func cancelDeferredDecode() {
+        deferredDecodeControlLock.lock()
+        let wasActive = deferredDecodeActive
+        deferredDecodeCancelRequested = true
+        deferredDecodePauseRequested = false
+        deferredDecodeControlLock.unlock()
+        guard wasActive else { return }
+        DispatchQueue.main.async {
+            self.deferredDecodeInProgress = false
+            self.deferredDecodePaused = false
+            self.deferredDecodeStatusText = ""
+            self.deferredDecodeETASeconds = 0
+        }
+    }
+
+    func setRealtimeDecodePaused(_ paused: Bool) {
+        realtimeDecodeControlLock.lock()
+        realtimeDecodePaused = paused
+        realtimeDecodeControlLock.unlock()
+    }
+
+    private func isRealtimeDecodePaused() -> Bool {
+        realtimeDecodeControlLock.lock()
+        let paused = realtimeDecodePaused
+        realtimeDecodeControlLock.unlock()
+        return paused
+    }
+
+    func decodeDeferredSamples(chunkSamples: Int = 32000) {
+        deferredDecodeQueue.async { [weak self] in
             guard let self = self else { return }
+            self.deferredDecodeControlLock.lock()
+            if self.deferredDecodeActive {
+                // Already decoding: treat as a resume request.
+                self.deferredDecodePauseRequested = false
+                self.deferredDecodeControlLock.unlock()
+                DispatchQueue.main.async {
+                    self.deferredDecodePaused = false
+                    if self.deferredDecodeInProgress {
+                        self.deferredDecodeStatusText = "Decoding background capture..."
+                    }
+                }
+                return
+            }
+            self.deferredDecodeActive = true
+            self.deferredDecodePauseRequested = false
+            self.deferredDecodeCancelRequested = false
+            self.deferredDecodeControlLock.unlock()
+            defer {
+                self.deferredDecodeControlLock.lock()
+                self.deferredDecodeActive = false
+                self.deferredDecodePauseRequested = false
+                self.deferredDecodeCancelRequested = false
+                self.deferredDecodeControlLock.unlock()
+            }
+
             let totalSamples = self.deferredSampleStore.totalSampleCount()
             guard totalSamples > 0 else {
                 DispatchQueue.main.async {
                     self.deferredDecodeInProgress = false
                     self.deferredDecodeProgress = 0
                     self.deferredDecodeStatusText = ""
+                    self.deferredDecodePaused = false
+                    self.deferredDecodeScannedSeconds = 0
+                    self.deferredDecodeETASeconds = 0
                 }
                 return
+            }
+
+            let decodeStartDate = Date()
+            let previousFastMode = self.deferredReplayFastMode
+            let previousRxDiag = self.radeWrapper.rxDiagnosticLoggingEnabled
+            let wasRealtimePaused = self.isRealtimeDecodePaused()
+            self.deferredReplayFastMode = true
+            self.radeWrapper.rxDiagnosticLoggingEnabled = false
+            self.setRealtimeDecodePaused(true)
+            defer {
+                self.deferredReplayFastMode = previousFastMode
+                self.radeWrapper.rxDiagnosticLoggingEnabled = previousRxDiag
+                self.setRealtimeDecodePaused(wasRealtimePaused)
+            }
+
+            @inline(__always) func waitIfPausedOrCancelled() -> Bool {
+                while true {
+                    self.deferredDecodeControlLock.lock()
+                    let paused = self.deferredDecodePauseRequested
+                    let cancelled = self.deferredDecodeCancelRequested
+                    self.deferredDecodeControlLock.unlock()
+                    if cancelled { return false }
+                    if !paused { return true }
+                    Thread.sleep(forTimeInterval: 0.1)
+                }
             }
 
             DispatchQueue.main.async {
                 self.deferredDecodeInProgress = true
                 self.deferredDecodeProgress = 0
                 self.deferredDecodeStatusText = "Decoding background capture..."
+                self.deferredDecodePaused = false
+                self.deferredDecodeScannedSeconds = 0
+                self.deferredDecodeETASeconds = 0
             }
 
-            self.deferredSampleStore.drain(chunkSamples: chunkSamples, process: { samples in
+            self.radeWrapper.clearInputBuffer()
+            self.radeWrapper.resetFargan()
+
+            let totalDecodeSamples = totalSamples
+            var processedDecodeSamples = 0
+            var lastUIUpdate = Date.distantPast
+            var cancelled = false
+
+            self.deferredSampleStore.drain(
+                chunkSamples: max(chunkSamples, 16000),
+                process: { samples in
+                guard waitIfPausedOrCancelled() else {
+                    cancelled = true
+                    return
+                }
                 samples.withUnsafeBufferPointer { buf in
                     guard let ptr = buf.baseAddress else { return }
-                    self.radeWrapper.rxProcessInputSamples(ptr, count: Int32(samples.count))
+                    self.radeWrapper.rxProcessInputSamples(ptr, count: Int32(buf.count))
                 }
-            }, onProgress: { processedSamples in
-                let progress = min(1.0, Double(processedSamples) / Double(totalSamples))
+                processedDecodeSamples += samples.count
+
+                let now = Date()
+                if now.timeIntervalSince(lastUIUpdate) >= 0.5 || processedDecodeSamples >= totalDecodeSamples {
+                    let progress = min(1.0, Double(processedDecodeSamples) / Double(max(totalDecodeSamples, 1)))
+                    let elapsed = max(now.timeIntervalSince(decodeStartDate), 0.001)
+                    let rate = Double(processedDecodeSamples) / elapsed
+                    let remaining = max(0, totalDecodeSamples - processedDecodeSamples)
+                    let eta = rate > 0 ? Double(remaining) / rate : 0
+                    let scannedSeconds = Double(processedDecodeSamples) / 8000.0
+                    DispatchQueue.main.async {
+                        self.deferredDecodeProgress = progress
+                        self.deferredDecodeScannedSeconds = scannedSeconds
+                        self.deferredDecodeETASeconds = eta
+                    }
+                    lastUIUpdate = now
+                }
+                },
+                shouldContinue: {
+                    self.deferredDecodeControlLock.lock()
+                    let keepGoing = !self.deferredDecodeCancelRequested
+                    self.deferredDecodeControlLock.unlock()
+                    return keepGoing
+                }
+            )
+
+            if cancelled {
                 DispatchQueue.main.async {
-                    self.deferredDecodeProgress = progress
+                    self.deferredDecodeInProgress = false
+                    self.deferredDecodePaused = false
+                    self.deferredDecodeStatusText = ""
+                    self.deferredDecodeETASeconds = 0
                 }
-            })
+                return
+            }
 
             DispatchQueue.main.async {
                 self.deferredDecodeProgress = 1.0
                 self.deferredDecodeInProgress = false
                 self.deferredDecodeStatusText = ""
+                self.deferredDecodePaused = false
+                self.deferredDecodeETASeconds = 0
             }
         }
     }
@@ -602,7 +762,7 @@ class AudioManager: ObservableObject {
         // triggering SwiftUI view body re-evaluation for invisible views.
         radeWrapper.onStatusUpdate = { [weak self] status in
             guard let self = self, let status = status else { return }
-            if self.backgroundMode { return }
+            if self.backgroundMode || self.deferredReplayFastMode { return }
             DispatchQueue.main.async { [weak self] in
                 self?.syncState = status.syncState
                 self?.snr = status.snr
@@ -619,8 +779,8 @@ class AudioManager: ObservableObject {
             guard let callsign = callsign else { return }
             let currentSNR = self?.snr ?? 0
             let frameCount = self?.receptionLogger?.currentSession?.totalModemFrames ?? 0
-            // Skip main thread dispatch in background (no one sees the UI)
-            if !(self?.backgroundMode ?? false) {
+            // Skip main thread dispatch in background / deferred replay fast mode.
+            if !(self?.backgroundMode ?? false) && !(self?.deferredReplayFastMode ?? false) {
                 DispatchQueue.main.async {
                     self?.decodedCallsign = callsign
                 }
@@ -631,7 +791,9 @@ class AudioManager: ObservableObject {
             self?.receptionLogger?.recordCallsign(callsign, snr: currentSNR, modemFrame: frameCount,
                                                    latitude: lat, longitude: lon)
             // Report to FreeDV Reporter (qso.freedv.org)
-            self?.reporter?.reportRx(callsign: callsign, snr: Int(currentSNR))
+            if !(self?.deferredReplayFastMode ?? false) {
+                self?.reporter?.reportRx(callsign: callsign, snr: Int(currentSNR))
+            }
         }
         
         // Modem frame processed — detect sync transitions and record snapshots
@@ -904,6 +1066,7 @@ class AudioManager: ObservableObject {
     }
     
     func stop() {
+        cancelDeferredDecode()
         // Signal processingQueue to skip pending work items immediately
         shouldProcess = false
         setDeferredFeatureStorageEnabled(false)
@@ -981,6 +1144,12 @@ class AudioManager: ObservableObject {
     private func processRXInput(buffer: AVAudioPCMBuffer) {
         guard let converter = rxConverter,
               let monoFmt = monoFloatFormat else { return }
+        
+        // During deferred foreground replay, pause real-time decode work entirely.
+        // This avoids spending CPU on conversion/backpressure logic that will be dropped anyway.
+        if isRealtimeDecodePaused() {
+            return
+        }
         
         // Step 1: Extract mono from input (handles both mono and stereo)
         let inputFrames = Int(buffer.frameLength)
@@ -1091,6 +1260,11 @@ class AudioManager: ObservableObject {
             return
         }
         
+        // Foreground deferred replay in progress: pause real-time decode/FFT to keep app smooth.
+        if isRealtimeDecodePaused() {
+            return
+        }
+        
         // RADE processing (may take 10-50ms per chunk due to neural network).
         // Apply queue backpressure so background does not accumulate unlimited chunks.
         var shouldEnqueue = false
@@ -1161,6 +1335,7 @@ class AudioManager: ObservableObject {
                 processingBackpressureLock.unlock()
             }
             guard shouldProcess else { return }
+            guard !isRealtimeDecodePaused() else { return }
             if backgroundMode {
                 backgroundRxChunkCount += 1
                 backgroundRxChunkLastDate = Date()
