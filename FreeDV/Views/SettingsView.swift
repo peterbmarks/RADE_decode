@@ -150,7 +150,7 @@ struct SettingsView: View {
             // About section
             Section("About") {
                 LabeledContent("Version", value: Bundle.main.shortVersion)
-                LabeledContent("License", value: "BSD-2-Clause")
+                LabeledContent("License", value: "LGPL-2.1-or-later")
                 Link("FreeDV Project", destination: URL(string: "https://freedv.org")!)
                 Link("Privacy Policy", destination: URL(string: "https://freedv.org/privacy")!)
             }
@@ -171,6 +171,11 @@ struct SettingsView: View {
                         name: "radae_decoder",
                         copyright: "Peter Marks",
                         license: "BSD-2-Clause"
+                    )
+                    LicenseRow(
+                        name: "EOO Callsign Codec",
+                        copyright: "David Rowe et al. / Mooneer Salem et al.",
+                        license: "LGPL-2.1-or-later"
                     )
                 }
                 .padding(.vertical, 4)
