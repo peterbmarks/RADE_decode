@@ -154,6 +154,27 @@ struct SettingsView: View {
                 Link("FreeDV Project", destination: URL(string: "https://freedv.org")!)
                 Link("Privacy Policy", destination: URL(string: "https://freedv.org/privacy")!)
             }
+            
+            Section("Open Source Licenses") {
+                VStack(alignment: .leading, spacing: 12) {
+                    LicenseRow(
+                        name: "RADE Modem Library",
+                        copyright: "David Rowe and contributors",
+                        license: "BSD-2-Clause"
+                    )
+                    LicenseRow(
+                        name: "Opus / FARGAN / LPCNet",
+                        copyright: "Xiph.Org Foundation / Amazon",
+                        license: "BSD-3-Clause"
+                    )
+                    LicenseRow(
+                        name: "radae_decoder",
+                        copyright: "Peter Marks",
+                        license: "BSD-2-Clause"
+                    )
+                }
+                .padding(.vertical, 4)
+            }
         }
         .navigationTitle("Settings")
         .onDisappear {
@@ -528,6 +549,27 @@ class BackgroundLocationHelper: NSObject, ObservableObject, CLLocationManagerDel
     func locationManagerDidChangeAuthorization(_ manager: CLLocationManager) {
         DispatchQueue.main.async {
             self.authStatus = manager.authorizationStatus
+        }
+    }
+}
+
+// MARK: - License Row
+
+private struct LicenseRow: View {
+    let name: String
+    let copyright: String
+    let license: String
+    
+    var body: some View {
+        VStack(alignment: .leading, spacing: 2) {
+            Text(name)
+                .font(.system(size: 14, weight: .semibold))
+            Text("\u{00A9} \(copyright)")
+                .font(.system(size: 12))
+                .foregroundStyle(.secondary)
+            Text("Licensed under \(license)")
+                .font(.system(size: 12))
+                .foregroundStyle(.tertiary)
         }
     }
 }

@@ -4,7 +4,7 @@
 <dict>
 	<key>com.apple.security.application-groups</key>
 	<array>
-		<string>group.yakumo2683.FreeDV</string>
+		<string>group.yakumo2683.RADE-Decode</string>
 	</array>
 </dict>
 </plist>

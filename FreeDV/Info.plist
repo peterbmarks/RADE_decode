@@ -2,28 +2,12 @@
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>
-	<key>CFBundleDisplayName</key>
-	<string>RADE Decode</string>
-	<key>NSMicrophoneUsageDescription</key>
-	<string>RADE Decode uses the microphone to receive audio from your radio receiver and decode digital voice (RADE) signals in real time.</string>
-	<key>NSLocationWhenInUseUsageDescription</key>
-	<string>RADE Decode uses your location to calculate your Maidenhead grid square for the FreeDV Reporter.</string>
-	<key>NSLocationAlwaysAndWhenInUseUsageDescription</key>
-	<string>RADE Decode records your GPS position when radio signals are received in the background, enabling accurate reception logging and Maidenhead grid square reporting.</string>
 	<key>UIBackgroundModes</key>
 	<array>
 		<string>audio</string>
 		<string>location</string>
 	</array>
-	<key>NSSupportsLiveActivities</key>
-	<true/>
 	<key>UILaunchScreen</key>
 	<dict/>
-	<key>UISupportedInterfaceOrientations</key>
-	<array>
-		<string>UIInterfaceOrientationPortrait</string>
-		<string>UIInterfaceOrientationLandscapeLeft</string>
-		<string>UIInterfaceOrientationLandscapeRight</string>
-	</array>
 </dict>
 </plist>

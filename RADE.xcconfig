@@ -17,7 +17,7 @@ GCC_PREPROCESSOR_DEFINITIONS[sdk=iphonesimulator*] = $(inherited) FREEDV_SIMULAT
 SWIFT_OBJC_BRIDGING_HEADER = $(SRCROOT)/FreeDV/Bridge/FreeDV-Bridging-Header.h
 
 // Microphone permission is required for RX/TX audio
-INFOPLIST_KEY_NSMicrophoneUsageDescription = FreeDV needs microphone access for radio transceiver audio processing.
+INFOPLIST_KEY_NSMicrophoneUsageDescription = RADE Decode uses the microphone to receive audio from your radio receiver and decode digital voice (RADE) signals in real time.
 
 // libopus.a is currently arm64 only; exclude x86_64 to avoid linker errors
 EXCLUDED_ARCHS = x86_64
