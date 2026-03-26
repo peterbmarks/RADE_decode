@@ -7,7 +7,6 @@ import Combine
 /// Settings page for audio device selection and app configuration.
 struct SettingsView: View {
     @Bindable var reporter: FreeDVReporter
-    var powerManager: PowerManager
     @StateObject private var deviceManager = AudioDeviceManager()
     @StateObject private var locationHelper = LocationHelper()
     
@@ -116,56 +115,6 @@ struct SettingsView: View {
                     }
                 }
                 #endif
-            }
-            
-            // Power management
-            Section("Power Profile") {
-                Picker("Profile", selection: Binding(
-                    get: { powerManager.currentProfile },
-                    set: { powerManager.currentProfile = $0 }
-                )) {
-                    ForEach(PowerManager.PowerProfile.allCases) { profile in
-                        Label(profile.rawValue, systemImage: profile.icon)
-                            .tag(profile)
-                    }
-                }
-                
-                if powerManager.currentProfile != .balanced {
-                    Text(powerManager.currentProfile.description)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                
-                Toggle("Auto-switch on low battery", isOn: Binding(
-                    get: { powerManager.autoSwitchEnabled },
-                    set: { powerManager.autoSwitchEnabled = $0 }
-                ))
-                
-                HStack {
-                    Text("Battery")
-                    Spacer()
-                    HStack(spacing: 4) {
-                        Image(systemName: powerManager.isCharging ? "battery.100percent.bolt" : "battery.50percent")
-                            .foregroundStyle(powerManager.batteryLevel < 0.2 ? .red : .green)
-                        Text(powerManager.batteryPercentage)
-                            .foregroundStyle(.secondary)
-                            .font(.subheadline)
-                    }
-                }
-            }
-            
-            // Haptic feedback
-            Section("Haptic Feedback") {
-                Toggle("Enable Haptics", isOn: Binding(
-                    get: { HapticManager.shared.isEnabled },
-                    set: { HapticManager.shared.isEnabled = $0 }
-                ))
-                if HapticManager.shared.isEnabled {
-                    LabeledContent("Sync locked", value: "Medium tap")
-                    LabeledContent("Signal lost", value: "Warning")
-                    LabeledContent("Callsign decoded", value: "Success")
-                    LabeledContent("Strong signal (>20dB)", value: "Light tap")
-                }
             }
             
             // GPS tracking & background location
@@ -585,6 +534,6 @@ class BackgroundLocationHelper: NSObject, ObservableObject, CLLocationManagerDel
 
 #Preview {
     NavigationStack {
-        SettingsView(reporter: FreeDVReporter(), powerManager: PowerManager())
+        SettingsView(reporter: FreeDVReporter())
     }
 }

@@ -8,6 +8,7 @@
 
 /* Begin PBXBuildFile section */
 		192DD5262F735DDC00CF7708 /* fix_compliance.sh in Resources */ = {isa = PBXBuildFile; fileRef = 192DD5252F735DDC00CF7708 /* fix_compliance.sh */; };
+		1962BABC2F74D6A00001FD34 /* HANDOVER_2026-03-26.md in Resources */ = {isa = PBXBuildFile; fileRef = 1962BABB2F74D6A00001FD34 /* HANDOVER_2026-03-26.md */; };
 		197838B72F70A51900D284DA /* RADE.xcconfig in Resources */ = {isa = PBXBuildFile; fileRef = 197838B62F70A51900D284DA /* RADE.xcconfig */; };
 		197838DC2F70AC8600D284DA /* rade_nnet.c in Sources */ = {isa = PBXBuildFile; fileRef = 197838DB2F70AC8600D284DA /* rade_nnet.c */; };
 		197838E02F70CDDF00D284DA /* eoo_callsign_codec_c.cpp in Sources */ = {isa = PBXBuildFile; fileRef = 197838DF2F70CDDF00D284DA /* eoo_callsign_codec_c.cpp */; };
@@ -44,6 +45,7 @@
 
 /* Begin PBXFileReference section */
 		192DD5252F735DDC00CF7708 /* fix_compliance.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = fix_compliance.sh; sourceTree = "<group>"; };
+		1962BABB2F74D6A00001FD34 /* HANDOVER_2026-03-26.md */ = {isa = PBXFileReference; lastKnownFileType = net.daringfireball.markdown; path = "HANDOVER_2026-03-26.md"; sourceTree = "<group>"; };
 		1978385F2F7028A000D284DA /* FreeDV.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = FreeDV.app; sourceTree = BUILT_PRODUCTS_DIR; };
 		1978388E2F702DFA00D284DA /* build_opus.sh */ = {isa = PBXFileReference; lastKnownFileType = text.script.sh; path = build_opus.sh; sourceTree = "<group>"; };
 		197838932F703AED00D284DA /* config.h */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.c.h; path = config.h; sourceTree = "<group>"; };
@@ -147,6 +149,7 @@
 				197838742F702D0E00D284DA /* Scripts */,
 				197838752F702D1100D284DA /* Libraries */,
 				192DD5252F735DDC00CF7708 /* fix_compliance.sh */,
+				1962BABB2F74D6A00001FD34 /* HANDOVER_2026-03-26.md */,
 			);
 			sourceTree = "<group>";
 		};
@@ -336,6 +339,7 @@
 			buildActionMask = 2147483647;
 			files = (
 				197838B72F70A51900D284DA /* RADE.xcconfig in Resources */,
+				1962BABC2F74D6A00001FD34 /* HANDOVER_2026-03-26.md in Resources */,
 				192DD5262F735DDC00CF7708 /* fix_compliance.sh in Resources */,
 			);
 			runOnlyForDeploymentPostprocessing = 0;

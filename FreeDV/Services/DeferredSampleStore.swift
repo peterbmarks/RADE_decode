@@ -1,31 +1,33 @@
 import Foundation
 
 /// Stores raw 8kHz Int16 samples to disk while app is in background.
-/// Samples are written as little-endian Int16 PCM stream.
+/// Supports multiple capture batches so a new background session doesn't
+/// corrupt an in-progress deferred decode of a previous batch.
 final class DeferredSampleStore {
     private let fileManager = FileManager.default
-    private var fileHandle: FileHandle?
+    private var writeHandle: FileHandle?
+    private var writeBatchIndex = 0
 
-    private var fileURL: URL {
-        let docs = fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
-        return docs.appendingPathComponent("deferred_samples.pcm")
+    private var docsDir: URL {
+        fileManager.urls(for: .documentDirectory, in: .userDomainMask)[0]
     }
+
+    private func batchURL(_ index: Int) -> URL {
+        docsDir.appendingPathComponent("deferred_samples_\(index).pcm")
+    }
+
+    // MARK: - Writing
 
     private func ensureWriter() -> FileHandle? {
-        if fileHandle == nil {
-            if !fileManager.fileExists(atPath: fileURL.path) {
-                fileManager.createFile(atPath: fileURL.path, contents: nil)
+        if writeHandle == nil {
+            let url = batchURL(writeBatchIndex)
+            if !fileManager.fileExists(atPath: url.path) {
+                fileManager.createFile(atPath: url.path, contents: nil)
             }
-            fileHandle = try? FileHandle(forWritingTo: fileURL)
-            fileHandle?.seekToEndOfFile()
+            writeHandle = try? FileHandle(forWritingTo: url)
+            writeHandle?.seekToEndOfFile()
         }
-        return fileHandle
-    }
-
-    func reset() {
-        fileHandle?.closeFile()
-        fileHandle = nil
-        try? fileManager.removeItem(at: fileURL)
+        return writeHandle
     }
 
     func appendRawInt16(_ samples: UnsafePointer<Int16>, count: Int) {
@@ -35,39 +37,102 @@ final class DeferredSampleStore {
         handle.write(data)
     }
 
-    func totalSampleCount() -> Int {
-        let bytes: UInt64
-        if let handle = fileHandle {
-            bytes = handle.seekToEndOfFile()
-        } else {
-            guard let attr = try? fileManager.attributesOfItem(atPath: fileURL.path),
-                  let size = attr[.size] as? NSNumber else {
-                return 0
-            }
-            bytes = size.uint64Value
-        }
-        return Int(bytes / UInt64(MemoryLayout<Int16>.size))
+    /// Close the current writer and start a new batch file.
+    /// Call this before enabling background capture when a previous batch
+    /// is still being drained by a paused decode.
+    func advanceBatch() {
+        writeHandle?.closeFile()
+        writeHandle = nil
+        writeBatchIndex += 1
     }
 
+    // MARK: - Reading
+
+    /// Returns sorted list of batch indices that have files on disk.
+    func pendingBatchIndices() -> [Int] {
+        let files = (try? fileManager.contentsOfDirectory(atPath: docsDir.path)) ?? []
+        return files.compactMap { name -> Int? in
+            guard name.hasPrefix("deferred_samples_"), name.hasSuffix(".pcm") else { return nil }
+            let s = String(name.dropFirst("deferred_samples_".count).dropLast(".pcm".count))
+            return Int(s)
+        }.sorted()
+    }
+
+    var hasPendingBatches: Bool {
+        !pendingBatchIndices().isEmpty
+    }
+
+    /// Sample count of the most recently written batch file.
+    func latestBatchSampleCount() -> Int {
+        guard let latest = pendingBatchIndices().last else { return 0 }
+        let url = batchURL(latest)
+        if latest == writeBatchIndex {
+            let bytes = writeHandle?.seekToEndOfFile() ?? 0
+            if bytes > 0 {
+                return Int(bytes / UInt64(MemoryLayout<Int16>.size))
+            }
+        }
+        guard let attr = try? fileManager.attributesOfItem(atPath: url.path),
+              let size = attr[.size] as? NSNumber else {
+            return 0
+        }
+        return Int(size.uint64Value / UInt64(MemoryLayout<Int16>.size))
+    }
+
+    /// Remove the most recently written batch file (e.g. too short to decode).
+    func removeLatestBatch() {
+        guard let latest = pendingBatchIndices().last else { return }
+        removeBatch(at: latest)
+    }
+
+    /// Remove a specific batch file by index.
+    func removeBatch(at index: Int) {
+        if index == writeBatchIndex {
+            writeHandle?.closeFile()
+            writeHandle = nil
+        }
+        try? fileManager.removeItem(at: batchURL(index))
+    }
+
+    /// Sample count of the oldest pending batch file.
+    func totalSampleCount() -> Int {
+        guard let oldest = pendingBatchIndices().first else { return 0 }
+        let url = batchURL(oldest)
+        // Close writer if it's the same batch we're about to read
+        if oldest == writeBatchIndex {
+            let bytes = writeHandle?.seekToEndOfFile() ?? 0
+            if bytes > 0 {
+                return Int(bytes / UInt64(MemoryLayout<Int16>.size))
+            }
+        }
+        guard let attr = try? fileManager.attributesOfItem(atPath: url.path),
+              let size = attr[.size] as? NSNumber else {
+            return 0
+        }
+        return Int(size.uint64Value / UInt64(MemoryLayout<Int16>.size))
+    }
+
+    /// Drain the oldest pending batch. The batch file is removed when done.
     func drain(
         chunkSamples: Int,
         process: ([Int16]) -> Void,
         onProgress: ((Int) -> Void)? = nil,
-        shouldContinue: (() -> Bool)? = nil,
-        removeFileWhenDone: Bool = true
+        shouldContinue: (() -> Bool)? = nil
     ) {
         guard chunkSamples > 0 else { return }
-        guard fileManager.fileExists(atPath: fileURL.path) else { return }
+        guard let oldest = pendingBatchIndices().first else { return }
+        let url = batchURL(oldest)
 
-        fileHandle?.closeFile()
-        fileHandle = nil
+        // Close writer if it's the same batch
+        if oldest == writeBatchIndex {
+            writeHandle?.closeFile()
+            writeHandle = nil
+        }
 
-        guard let reader = try? FileHandle(forReadingFrom: fileURL) else { return }
+        guard let reader = try? FileHandle(forReadingFrom: url) else { return }
         defer {
             try? reader.close()
-            if removeFileWhenDone {
-                try? fileManager.removeItem(at: fileURL)
-            }
+            try? fileManager.removeItem(at: url)
         }
 
         let chunkBytes = chunkSamples * MemoryLayout<Int16>.size
@@ -100,5 +165,14 @@ final class DeferredSampleStore {
                 break
             }
         }
+    }
+
+    func reset() {
+        writeHandle?.closeFile()
+        writeHandle = nil
+        for index in pendingBatchIndices() {
+            try? fileManager.removeItem(at: batchURL(index))
+        }
+        writeBatchIndex = 0
     }
 }

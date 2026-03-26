@@ -5,25 +5,33 @@ import SwiftData
 /// ViewModel managing RX state, bridging AudioManager to SwiftUI views.
 @MainActor
 class TransceiverViewModel: ObservableObject {
+    enum BackgroundAnalysisTaskStatus: String {
+        case pending = "Pending"
+        case running = "Running"
+        case paused = "Paused"
+        case completed = "Done"
+        case cancelled = "Cancelled"
+    }
+
+    struct BackgroundAnalysisTask: Identifiable {
+        let id: UUID
+        let createdAt: Date
+        var title: String
+        var status: BackgroundAnalysisTaskStatus
+        var progress: Double
+        var scannedSeconds: Double
+        var etaSeconds: Double
+        var signalCount: Int = 0
+        /// Index of the deferred sample batch file this task decodes.
+        var batchIndex: Int?
+    }
     
     private let audioManager = AudioManager()
     private let deviceManager = AudioDeviceManager()
-    let liveActivity = LiveActivityManager()
     
     /// FreeDV Reporter integration — set from the view layer.
     var reporter: FreeDVReporter? {
         didSet { audioManager.reporter = reporter }
-    }
-    
-    /// Power management — controls UI update rate and FFT/waterfall.
-    var powerManager: PowerManager? {
-        didSet {
-            guard let pm = powerManager else { return }
-            if !isInBackground {
-                audioManager.fftEnabled = pm.fftEnabled
-            }
-            restartStatusTimer(interval: isInBackground ? backgroundTimerInterval : pm.uiUpdateInterval)
-        }
     }
     
     /// Whether the app is currently in the background
@@ -70,6 +78,7 @@ class TransceiverViewModel: ObservableObject {
     @Published var deferredDecodePaused = false
     @Published var deferredDecodeScannedSeconds: Double = 0
     @Published var deferredDecodeETASeconds: Double = 0
+    @Published var backgroundAnalysisTasks: [BackgroundAnalysisTask] = []
     
     private var statusTimer: Timer?
     private let maxWaterfallRows = 100
@@ -79,6 +88,9 @@ class TransceiverViewModel: ObservableObject {
 
     private var backgroundObservers: [Any] = []
     private var backgroundEnterTime: Date?
+    private var deferredDecodeWasActiveBeforeBackground = false
+    private var lastDeferredDecodeInProgress = false
+    private var lastDeferredDecodeProgress: Double = 0
     
     init() {
         setupBindings()
@@ -93,18 +105,7 @@ class TransceiverViewModel: ObservableObject {
 
     // MARK: - Bindings
 
-    /// Track previous sync state for haptic edge detection
-    private var previousSyncState: RADESyncState = .searching
-    /// Track previous callsign for haptic on new decode
-    private var previousCallsign: String = ""
-    /// Throttle strong signal haptics (at most once per 10 seconds)
-    private var lastStrongSignalHaptic: Date = .distantPast
-
-    
     private func setupBindings() {
-        // Pre-warm haptic engines
-        HapticManager.shared.prepare()
-        
         // Observe AudioManager state changes
         statusTimer = Timer.scheduledTimer(withTimeInterval: currentTimerInterval, repeats: true) { [weak self] _ in
             guard let self = self, !self.isProcessingTick else { return }
@@ -113,41 +114,12 @@ class TransceiverViewModel: ObservableObject {
                 guard let self = self else { return }
                 defer { self.isProcessingTick = false }
                 
-                // Update isRunning FIRST so haptic/live activity checks see current state
+                // Update isRunning first for dependent UI state.
                 let amIsRunning = self.audioManager.isRunning
                 self.isRunning = amIsRunning
                 
                 let newSyncState = self.audioManager.syncState
                 let newSNR = self.audioManager.snr
-                
-                // Haptic feedback + Live Activity on sync state transitions
-                if amIsRunning && newSyncState != self.previousSyncState {
-                    if newSyncState == .synced && self.previousSyncState != .synced {
-                        HapticManager.shared.onSync()
-                    } else if newSyncState == .searching && self.previousSyncState == .synced {
-                        HapticManager.shared.onUnsync()
-                    }
-                    self.previousSyncState = newSyncState
-                    // Update Live Activity on sync transitions
-                    self.liveActivity.updateActivity(
-                        syncState: newSyncState.rawValue,
-                        snr: newSNR,
-                        freqOffsetHz: self.audioManager.freqOffset,
-                        lastCallsign: ""
-                    )
-                }
-                
-                // Skip haptics and heavy UI updates when in background
-                if !self.isInBackground {
-                    // Haptic feedback on strong signal (SNR > 20 dB, throttled)
-                    if amIsRunning && newSyncState == .synced && newSNR > 20 {
-                        let now = Date()
-                        if now.timeIntervalSince(self.lastStrongSignalHaptic) > 10 {
-                            HapticManager.shared.onStrongSignal()
-                            self.lastStrongSignalHaptic = now
-                        }
-                    }
-                }
                 
                 self.syncState = newSyncState
                 self.snr = newSNR
@@ -161,9 +133,9 @@ class TransceiverViewModel: ObservableObject {
                     if newFFT != self.fftData {
                         self.fftData = newFFT
                         self.waterfallHistory.append(newFFT)
-                        if self.waterfallHistory.count > self.maxWaterfallRows {
-                            self.waterfallHistory.removeFirst(
-                                self.waterfallHistory.count - self.maxWaterfallRows)
+                        let excess = self.waterfallHistory.count - self.maxWaterfallRows
+                        if excess > 0 {
+                            self.waterfallHistory.removeFirst(excess)
                         }
                     }
                     
@@ -177,22 +149,12 @@ class TransceiverViewModel: ObservableObject {
                 self.deferredDecodePaused = self.audioManager.deferredDecodePaused
                 self.deferredDecodeScannedSeconds = self.audioManager.deferredDecodeScannedSeconds
                 self.deferredDecodeETASeconds = self.audioManager.deferredDecodeETASeconds
+                self.syncBackgroundAnalysisTasks()
                 
-                // Update decoded callsign from EOO + haptic on new callsign
+                // Update decoded callsign from EOO.
                 let newCallsign = self.audioManager.decodedCallsign
                 if !newCallsign.isEmpty && newCallsign != self.decodedCallsign {
                     self.decodedCallsign = newCallsign
-                    if newCallsign != self.previousCallsign {
-                        HapticManager.shared.onCallsign()
-                        self.previousCallsign = newCallsign
-                        // Update Live Activity with new callsign
-                        self.liveActivity.updateActivity(
-                            syncState: newSyncState.rawValue,
-                            snr: newSNR,
-                            freqOffsetHz: self.audioManager.freqOffset,
-                            lastCallsign: newCallsign
-                        )
-                    }
                 }
             }
         }
@@ -211,6 +173,25 @@ class TransceiverViewModel: ObservableObject {
     func toggleDeferredDecodePause() {
         audioManager.setDeferredDecodePaused(!deferredDecodePaused)
     }
+
+    func startDeferredDecodeAnalysis() {
+        if deferredDecodeInProgress {
+            if deferredDecodePaused {
+                audioManager.setDeferredDecodePaused(false)
+            }
+            return
+        }
+        ensurePendingTaskExists()
+        audioManager.decodeDeferredSamples()
+    }
+
+    func cancelDeferredDecodeAnalysis() {
+        audioManager.cancelDeferredDecode()
+    }
+
+    func removeBackgroundAnalysisTask(id: UUID) {
+        backgroundAnalysisTasks.removeAll { $0.id == id }
+    }
     
     func startTransceiver() {
         backgroundHealthText = ""
@@ -221,14 +202,10 @@ class TransceiverViewModel: ObservableObject {
         audioManager.resetDeferredSamples()
 
         audioManager.startRX()
-        // Start Live Activity with current reporter frequency
-        let freqMHz = String(format: "%.3f", Double(reporter?.frequencyHz ?? 14_236_000) / 1_000_000)
-        liveActivity.startActivity(frequencyMHz: freqMHz)
     }
     
     func stopTransceiver() {
         audioManager.stop()
-        liveActivity.endActivity()
 
         backgroundHealthText = ""
         backgroundHealthIsHealthy = false
@@ -236,7 +213,7 @@ class TransceiverViewModel: ObservableObject {
         audioManager.resetBackgroundHeartbeat()
     }
     
-    /// Restart the status polling timer with a new interval (for power profile changes).
+    /// Restart the status polling timer.
     func restartStatusTimer(interval: TimeInterval) {
         statusTimer?.invalidate()
         statusTimer = nil
@@ -247,6 +224,14 @@ class TransceiverViewModel: ObservableObject {
     // MARK: - Background / Foreground
     
     private func observeAppLifecycle() {
+        let resign = NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil, queue: .main
+        ) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.pauseDeferredDecodeForLifecycleIfNeeded()
+            }
+        }
         let bg = NotificationCenter.default.addObserver(
             forName: UIApplication.didEnterBackgroundNotification,
             object: nil, queue: .main
@@ -263,7 +248,100 @@ class TransceiverViewModel: ObservableObject {
                 self?.exitBackground()
             }
         }
-        backgroundObservers = [bg, fg]
+        backgroundObservers = [resign, bg, fg]
+    }
+
+    private func pauseDeferredDecodeForLifecycleIfNeeded() {
+        let wasActive = audioManager.deferredDecodeInProgress
+        if wasActive {
+            deferredDecodeWasActiveBeforeBackground = true
+            audioManager.setDeferredDecodePaused(true)
+        }
+    }
+
+    private func enqueueBackgroundAnalysisTask() {
+        let index = backgroundAnalysisTasks.count + 1
+        let task = BackgroundAnalysisTask(
+            id: UUID(),
+            createdAt: Date(),
+            title: "Capture #\(index)",
+            status: .pending,
+            progress: 0,
+            scannedSeconds: 0,
+            etaSeconds: 0,
+            batchIndex: audioManager.latestPendingBatchIndex
+        )
+        backgroundAnalysisTasks.insert(task, at: 0)
+    }
+
+    /// Remove a pending task and its corresponding batch file from disk.
+    func removePendingBackgroundAnalysisTask(id: UUID) {
+        guard let task = backgroundAnalysisTasks.first(where: { $0.id == id }),
+              task.status == .pending else { return }
+        if let batchIndex = task.batchIndex {
+            audioManager.removeDeferredBatch(at: batchIndex)
+            appLog("ViewModel: removed pending task batch \(batchIndex)")
+        }
+        backgroundAnalysisTasks.removeAll { $0.id == id }
+    }
+
+    private func ensurePendingTaskExists() {
+        let hasPending = backgroundAnalysisTasks.contains { $0.status == .pending }
+        let hasRunning = backgroundAnalysisTasks.contains { $0.status == .running || $0.status == .paused }
+        if !hasPending && !hasRunning {
+            enqueueBackgroundAnalysisTask()
+        }
+    }
+
+    private func syncBackgroundAnalysisTasks() {
+        if deferredDecodeInProgress {
+            let sigCount = audioManager.deferredDecodeSignalCount
+            if let index = backgroundAnalysisTasks.firstIndex(where: { $0.status == .running || $0.status == .paused }) {
+                backgroundAnalysisTasks[index].status = deferredDecodePaused ? .paused : .running
+                backgroundAnalysisTasks[index].progress = deferredDecodeProgress
+                backgroundAnalysisTasks[index].scannedSeconds = deferredDecodeScannedSeconds
+                backgroundAnalysisTasks[index].etaSeconds = deferredDecodeETASeconds
+                backgroundAnalysisTasks[index].signalCount = sigCount
+            } else if let pendingIndex = backgroundAnalysisTasks.lastIndex(where: { $0.status == .pending }) {
+                backgroundAnalysisTasks[pendingIndex].status = deferredDecodePaused ? .paused : .running
+                backgroundAnalysisTasks[pendingIndex].progress = deferredDecodeProgress
+                backgroundAnalysisTasks[pendingIndex].scannedSeconds = deferredDecodeScannedSeconds
+                backgroundAnalysisTasks[pendingIndex].etaSeconds = deferredDecodeETASeconds
+                backgroundAnalysisTasks[pendingIndex].signalCount = sigCount
+            } else {
+                var task = BackgroundAnalysisTask(
+                    id: UUID(),
+                    createdAt: Date(),
+                    title: "Capture #\(backgroundAnalysisTasks.count + 1)",
+                    status: deferredDecodePaused ? .paused : .running,
+                    progress: deferredDecodeProgress,
+                    scannedSeconds: deferredDecodeScannedSeconds,
+                    etaSeconds: deferredDecodeETASeconds
+                )
+                if task.progress >= 1 { task.progress = 0.999 }
+                backgroundAnalysisTasks.insert(task, at: 0)
+            }
+        } else if lastDeferredDecodeInProgress {
+            if let index = backgroundAnalysisTasks.firstIndex(where: { $0.status == .running || $0.status == .paused }) {
+                // Use current progress (not last tick's) because AudioManager sets
+                // progress=1.0 and inProgress=false in the same main queue dispatch.
+                let completed = deferredDecodeProgress >= 0.999 || lastDeferredDecodeProgress >= 0.999
+                backgroundAnalysisTasks[index].status = completed ? .completed : .cancelled
+                backgroundAnalysisTasks[index].progress = completed ? 1.0 : backgroundAnalysisTasks[index].progress
+                backgroundAnalysisTasks[index].etaSeconds = 0
+                backgroundAnalysisTasks[index].signalCount = audioManager.deferredDecodeSignalCount
+
+                // Auto-chain: if a pending task exists, start the next decode batch
+                if completed, backgroundAnalysisTasks.contains(where: { $0.status == .pending }) {
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.3) { [weak self] in
+                        self?.startDeferredDecodeAnalysis()
+                    }
+                }
+            }
+        }
+
+        lastDeferredDecodeInProgress = deferredDecodeInProgress
+        lastDeferredDecodeProgress = deferredDecodeProgress
     }
     
     private func enterBackground() {
@@ -283,8 +361,14 @@ class TransceiverViewModel: ObservableObject {
         audioManager.backgroundMode = true
         audioManager.setBackgroundDecodeOnly(true)
         audioManager.setDeferredFeatureStorageEnabled(false)
+        pauseDeferredDecodeForLifecycleIfNeeded()
+        // Advance to a new batch file so new background captures
+        // don't corrupt the paused decode's data.
+        if deferredDecodeWasActiveBeforeBackground {
+            audioManager.advanceDeferredSampleBatch()
+        }
+        audioManager.hadRawSampleCapture = false
         audioManager.setBackgroundRawSampleCaptureEnabled(true)
-        audioManager.setDeferredDecodePaused(true)
         LogManager.shared.backgroundMode = true
         // Stop the UI timer entirely — no SwiftUI updates needed in background.
         // Live Activity updates come from AudioManager's background callback instead.
@@ -311,15 +395,24 @@ class TransceiverViewModel: ObservableObject {
         }
         #endif
         
-        bgLog("ViewModel: entered background mode (FFT off, timer stopped)")
+        bgLog("ViewModel: entered background mode (FFT off, timer stopped, deferredWasActive=\(deferredDecodeWasActiveBeforeBackground))")
     }
     
     private func exitBackground() {
         isInBackground = false
 
+        // Detect background capture: check heartbeat, raw-capture flag, AND
+        // whether new batch files appeared on disk (most reliable).
+        let heartbeat = audioManager.backgroundHeartbeatSnapshot()
+        let hadRawCapture = audioManager.hadRawSampleCapture
+        let pendingBatches = audioManager.pendingDeferredBatchCount
+        let existingRunningOrPending = backgroundAnalysisTasks.filter { $0.status == .running || $0.status == .paused || $0.status == .pending }.count
+        let hadBackgroundCapture = heartbeat.rxChunkCount > 0
+            || hadRawCapture
+            || pendingBatches > existingRunningOrPending
+
         if let enterTime = backgroundEnterTime {
             let elapsed = Int(Date().timeIntervalSince(enterTime))
-            let heartbeat = audioManager.backgroundHeartbeatSnapshot()
             if heartbeat.count > 0, let last = heartbeat.lastDate {
                 let lag = Int(Date().timeIntervalSince(last))
                 backgroundHealthText = "BG decode OK · \(heartbeat.count) updates in \(elapsed)s (last \(lag)s ago)"
@@ -338,17 +431,48 @@ class TransceiverViewModel: ObservableObject {
             }
         }
 
+        appLog("ViewModel: exitBackground hadCapture=\(hadBackgroundCapture) rawFlag=\(hadRawCapture) rxChunks=\(heartbeat.rxChunkCount) batches=\(pendingBatches) existingTasks=\(existingRunningOrPending) deferredWasActive=\(deferredDecodeWasActiveBeforeBackground)")
+
         // Remove background callback
         audioManager.onBackgroundStatusUpdate = nil
         audioManager.backgroundMode = false
         audioManager.setBackgroundRawSampleCaptureEnabled(false)
         audioManager.setDeferredFeatureStorageEnabled(false)
         audioManager.setBackgroundDecodeOnly(false)
-        audioManager.setDeferredDecodePaused(false)
         LogManager.shared.backgroundMode = false
+        // Skip recordings shorter than 5 seconds — not enough data to decode meaningfully.
+        let minSamplesForDecode = 8000 * 5  // 8kHz × 5s
+        let latestBatchSamples = audioManager.latestDeferredBatchSampleCount
+        if hadBackgroundCapture && latestBatchSamples >= minSamplesForDecode {
+            enqueueBackgroundAnalysisTask()
+            appLog("ViewModel: enqueued analysis task (total: \(backgroundAnalysisTasks.count))")
+        } else if hadBackgroundCapture {
+            appLog("ViewModel: skipped short capture (\(String(format: "%.1f", Double(latestBatchSamples) / 8000.0))s < 5s), removing batch")
+            audioManager.removeLatestDeferredBatch()
+        }
 
-        // Foreground: decode deferred background raw samples into session audio log.
-        audioManager.decodeDeferredSamples()
+        if deferredDecodeWasActiveBeforeBackground {
+            // If user left app mid-analysis, keep it paused after returning.
+            audioManager.setDeferredDecodePaused(true)
+            deferredDecodeWasActiveBeforeBackground = false
+            // Ensure a pending task exists for the new capture regardless of detection.
+            // But only if the captured audio is long enough to decode.
+            if !backgroundAnalysisTasks.contains(where: { $0.status == .pending }),
+               latestBatchSamples >= minSamplesForDecode {
+                enqueueBackgroundAnalysisTask()
+                appLog("ViewModel: force-enqueued task for paused-decode return (total: \(backgroundAnalysisTasks.count))")
+            } else if latestBatchSamples < minSamplesForDecode {
+                appLog("ViewModel: skipped force-enqueue, capture too short (\(String(format: "%.1f", Double(latestBatchSamples) / 8000.0))s)")
+                audioManager.removeLatestDeferredBatch()
+            }
+            // The paused decode will resume when the user taps Resume.
+            // After it completes, syncBackgroundAnalysisTasks auto-chains
+            // the next pending task.
+        } else {
+            audioManager.setDeferredDecodePaused(false)
+            // Foreground: decode deferred background raw samples into session audio log.
+            audioManager.decodeDeferredSamples()
+        }
         
         #if os(iOS)
         // Ensure no transition task is left running.
@@ -358,10 +482,10 @@ class TransceiverViewModel: ObservableObject {
         
         // Check if audio engine is still running after returning from background
         audioManager.checkEngineHealth()
-        // Restore FFT based on power profile
-        audioManager.fftEnabled = powerManager?.fftEnabled ?? true
+        // Restore FFT and UI timer in foreground.
+        audioManager.fftEnabled = true
         // Restart the UI timer
-        restartStatusTimer(interval: powerManager?.uiUpdateInterval ?? 0.15)
+        restartStatusTimer(interval: 0.15)
         bgLog("ViewModel: exited background mode (settings restored)")
     }
     

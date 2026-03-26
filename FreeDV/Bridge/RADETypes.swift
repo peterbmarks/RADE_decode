@@ -206,7 +206,8 @@ class RADEWrapper {
                 }
             }
 
-            // Remove consumed samples
+            // Remove consumed samples (re-check count to guard against concurrent clearInputBuffer)
+            guard rxInputBuffer.count >= nin else { break }
             rxInputBuffer.removeFirst(nin)
 
             // Update status

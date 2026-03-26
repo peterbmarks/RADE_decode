@@ -33,7 +33,11 @@ class ReceptionSession {
     
     var duration: TimeInterval {
         guard let end = endTime else { return Date().timeIntervalSince(startTime) }
-        return end.timeIntervalSince(startTime)
+        let wallDuration = end.timeIntervalSince(startTime)
+        // During deferred replay, wall clock is compressed (faster-than-realtime processing).
+        // Use modem frame count as a floor: each RADE frame ≈ 960 samples at 8kHz = 0.12s.
+        let frameDuration = Double(totalModemFrames) * 0.12
+        return max(wallDuration, frameDuration)
     }
     
     var syncRatio: Double {

@@ -5,7 +5,6 @@ import CoreLocation
 /// Main transceiver UI — professional ham radio interface with dark theme.
 struct TransceiverView: View {
     var reporter: FreeDVReporter
-    var powerManager: PowerManager
     @StateObject private var viewModel = TransceiverViewModel()
     @Environment(\.modelContext) private var modelContext
     @State private var isOutdoorMode = false
@@ -43,31 +42,21 @@ struct TransceiverView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 4)
 
-                        if viewModel.deferredDecodeInProgress {
-                            DeferredDecodeProgressCard(viewModel: viewModel)
-                                .padding(.horizontal, 16)
-                                .padding(.top, 8)
+                        // Spectrum + Waterfall stacked display
+                        VStack(spacing: 1) {
+                            SpectrumView(fftData: viewModel.fftData)
+                                .frame(height: geo.size.height * 0.18)
+
+                            WaterfallView(history: viewModel.waterfallHistory)
+                                .frame(height: geo.size.height * 0.22)
                         }
-                        
-                        // Spectrum + Waterfall stacked display (hidden in ultraLow)
-                        if powerManager.fftEnabled {
-                            VStack(spacing: 1) {
-                                SpectrumView(fftData: viewModel.fftData)
-                                    .frame(height: geo.size.height * (powerManager.waterfallEnabled ? 0.18 : 0.30))
-                                
-                                if powerManager.waterfallEnabled {
-                                    WaterfallView(history: viewModel.waterfallHistory)
-                                        .frame(height: geo.size.height * 0.22)
-                                }
-                            }
-                            .clipShape(RoundedRectangle(cornerRadius: 8))
-                            .overlay(
-                                RoundedRectangle(cornerRadius: 8)
-                                    .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
-                            )
-                            .padding(.horizontal, 16)
-                            .padding(.top, 8)
-                        }
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 8)
+                                .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
+                        )
+                        .padding(.horizontal, 16)
+                        .padding(.top, 8)
                         
                         // Level meters
                         VStack(spacing: 6) {
@@ -119,8 +108,8 @@ struct TransceiverView: View {
                     }
                 }
                 ToolbarItem(placement: .automatic) {
-                    NavigationLink(destination: LogView()) {
-                        Image(systemName: "doc.text.magnifyingglass")
+                    NavigationLink(destination: BackgroundAnalysisView(viewModel: viewModel)) {
+                        Image(systemName: "waveform.and.magnifyingglass")
                             .foregroundStyle(.gray)
                     }
                 }
@@ -145,9 +134,6 @@ struct TransceiverView: View {
             .onAppear {
                 viewModel.configureLogger(modelContainer: modelContext.container)
                 viewModel.reporter = reporter
-                viewModel.powerManager = powerManager
-                // Clean up any Live Activities left over from a previous crash/kill
-                viewModel.liveActivity.cleanupStaleActivities()
             }
         }
     }
@@ -289,90 +275,355 @@ struct BackgroundHintLabel: View {
     private let authStatus = CLLocationManager().authorizationStatus
     
     var body: some View {
-        VStack(spacing: 2) {
-            if authStatus == .authorizedAlways {
-                Text("Continues in background")
-                    .font(.system(size: 9))
-                    .foregroundStyle(Color.gray.opacity(0.35))
-            } else {
-                Text("Enable \"Always\" location in Settings for background RX")
-                    .font(.system(size: 9))
-                    .foregroundStyle(Color.orange.opacity(0.6))
-            }
-
-            if !viewModel.backgroundHealthText.isEmpty {
-                Text(viewModel.backgroundHealthText)
-                    .font(.system(size: 9, weight: .medium, design: .monospaced))
-                    .foregroundStyle(viewModel.backgroundHealthIsHealthy ? .green : .orange)
-                    .lineLimit(1)
-            }
+        if authStatus == .authorizedAlways {
+            Text("Continues in background")
+                .font(.system(size: 9))
+                .foregroundStyle(Color.gray.opacity(0.35))
+        } else {
+            Text("Enable \"Always\" location in Settings for background RX")
+                .font(.system(size: 9))
+                .foregroundStyle(Color.orange.opacity(0.6))
         }
     }
 }
 
-// MARK: - Deferred Decode Progress
+// MARK: - Background Analysis
 
-struct DeferredDecodeProgressCard: View {
+struct BackgroundAnalysisView: View {
     @ObservedObject var viewModel: TransceiverViewModel
 
+    private var activeTasks: [TransceiverViewModel.BackgroundAnalysisTask] {
+        viewModel.backgroundAnalysisTasks.filter { $0.status == .running || $0.status == .paused }
+    }
+
+    private var pendingTasks: [TransceiverViewModel.BackgroundAnalysisTask] {
+        viewModel.backgroundAnalysisTasks.filter { $0.status == .pending }
+    }
+
+    private var finishedTasks: [TransceiverViewModel.BackgroundAnalysisTask] {
+        viewModel.backgroundAnalysisTasks.filter { $0.status == .completed || $0.status == .cancelled }
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Image(systemName: "tray.and.arrow.down.fill")
-                    .font(.system(size: 11))
-                    .foregroundStyle(.blue)
-                Text(viewModel.deferredDecodeStatusText.isEmpty
-                     ? "Decoding Background Capture"
-                     : viewModel.deferredDecodeStatusText)
-                    .font(.system(size: 11, weight: .semibold, design: .monospaced))
-                    .foregroundStyle(.primary)
+        Group {
+            if viewModel.backgroundAnalysisTasks.isEmpty {
+                ContentUnavailableView(
+                    "No Analysis Tasks",
+                    systemImage: "waveform.and.magnifyingglass",
+                    description: Text("Background analysis replays captured audio to decode signals received while the app was in the background. Tasks appear here automatically.")
+                )
+            } else {
+                List {
+                    ForEach(activeTasks) { task in
+                        ActiveTaskCard(task: task, viewModel: viewModel)
+                            .listRowBackground(Color.clear)
+                            .listRowSeparator(.hidden)
+                            .listRowInsets(EdgeInsets(top: 8, leading: 16, bottom: 8, trailing: 16))
+                    }
+
+                    if !pendingTasks.isEmpty {
+                        Section {
+                            ForEach(pendingTasks) { task in
+                                CompactTaskCard(task: task)
+                                    .listRowBackground(Color.clear)
+                                    .listRowSeparator(.hidden)
+                                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                        Button(role: .destructive) {
+                                            viewModel.removePendingBackgroundAnalysisTask(id: task.id)
+                                        } label: {
+                                            Label("Delete", systemImage: "trash")
+                                        }
+                                    }
+                            }
+                        } header: {
+                            Text("QUEUED")
+                                .font(.caption.weight(.semibold))
+                        }
+                    }
+
+                    if !finishedTasks.isEmpty {
+                        Section {
+                            ForEach(finishedTasks) { task in
+                                CompactTaskCard(task: task)
+                                    .listRowBackground(Color.clear)
+                                    .listRowSeparator(.hidden)
+                                    .listRowInsets(EdgeInsets(top: 4, leading: 16, bottom: 4, trailing: 16))
+                                    .swipeActions(edge: .trailing, allowsFullSwipe: true) {
+                                        Button(role: .destructive) {
+                                            viewModel.removeBackgroundAnalysisTask(id: task.id)
+                                        } label: {
+                                            Label("Delete", systemImage: "trash")
+                                        }
+                                    }
+                            }
+                        } header: {
+                            Text("COMPLETED")
+                                .font(.caption.weight(.semibold))
+                        }
+                    }
+                }
+                .listStyle(.plain)
+                .safeAreaInset(edge: .bottom) {
+                    if !viewModel.deferredDecodeInProgress && !pendingTasks.isEmpty {
+                        startAnalysisButton
+                            .padding(.horizontal, 16)
+                            .padding(.bottom, 8)
+                            .padding(.top, 12)
+                            .background(.ultraThinMaterial)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Background Analysis")
+    }
+
+    @ViewBuilder
+    private var startAnalysisButton: some View {
+        Button {
+            viewModel.startDeferredDecodeAnalysis()
+        } label: {
+            Label("Start Analysis", systemImage: "play.fill")
+                .font(.headline)
+                .frame(maxWidth: .infinity)
+                .padding(.vertical, 14)
+                .background(Color.blue)
+                .foregroundStyle(.white)
+                .clipShape(RoundedRectangle(cornerRadius: 12))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+// MARK: - Active Task Card
+
+private struct ActiveTaskCard: View {
+    let task: TransceiverViewModel.BackgroundAnalysisTask
+    @ObservedObject var viewModel: TransceiverViewModel
+
+    private var color: Color {
+        task.status == .paused ? .orange : .blue
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 12) {
+            // Header
+            HStack(spacing: 10) {
+                statusIcon
+                    .font(.title2)
+
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(task.title)
+                        .font(.headline)
+                    Text(relativeTimestamp(task.createdAt))
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
                 Spacer()
-                Text(String(format: "%.0f%%", viewModel.deferredDecodeProgress * 100))
-                    .font(.system(size: 11, weight: .bold, design: .monospaced))
-                    .foregroundStyle(.secondary)
+
+                Text(task.status == .running ? "Analyzing" : "Paused")
+                    .font(.caption.weight(.semibold))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(color.opacity(0.15))
+                    .foregroundStyle(color)
+                    .clipShape(Capsule())
             }
 
-            ProgressView(value: viewModel.deferredDecodeProgress)
-                .tint(.blue)
+            // Progress
+            VStack(alignment: .leading, spacing: 6) {
+                ProgressView(value: task.progress)
+                    .tint(color)
 
-            HStack(spacing: 10) {
-                Text("Scanned \(formatTime(viewModel.deferredDecodeScannedSeconds))")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Text("ETA \(formatTime(viewModel.deferredDecodeETASeconds))")
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button(action: { viewModel.toggleDeferredDecodePause() }) {
-                    Label(viewModel.deferredDecodePaused ? "Resume" : "Pause",
-                          systemImage: viewModel.deferredDecodePaused ? "play.fill" : "pause.fill")
-                        .font(.system(size: 10, weight: .semibold, design: .monospaced))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 4)
-                        .background(Color.white.opacity(0.08))
-                        .clipShape(RoundedRectangle(cornerRadius: 5))
+                HStack {
+                    Text(String(format: "%.0f%%", task.progress * 100))
+                        .font(.system(.subheadline, design: .monospaced).bold())
+
+                    Spacer()
+
+                    Label(formatDuration(task.scannedSeconds), systemImage: "clock")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+
+                    Label(formatETA(task.etaSeconds), systemImage: "hourglass")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if task.signalCount > 0 {
+                    Label("\(task.signalCount) signal\(task.signalCount == 1 ? "" : "s") found", systemImage: "antenna.radiowaves.left.and.right")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+            }
+
+            // Inline controls
+            HStack(spacing: 12) {
+                Button {
+                    viewModel.toggleDeferredDecodePause()
+                } label: {
+                    Label(
+                        task.status == .paused ? "Resume" : "Pause",
+                        systemImage: task.status == .paused ? "play.fill" : "pause.fill"
+                    )
+                    .font(.subheadline.weight(.medium))
+                    .frame(maxWidth: .infinity)
+                    .padding(.vertical, 10)
+                    .background(Color.white.opacity(0.08))
+                    .clipShape(RoundedRectangle(cornerRadius: 8))
+                }
+                .buttonStyle(.plain)
+
+                Button {
+                    viewModel.cancelDeferredDecodeAnalysis()
+                } label: {
+                    Label("Cancel", systemImage: "xmark")
+                        .font(.subheadline.weight(.medium))
+                        .foregroundStyle(.red)
+                        .frame(maxWidth: .infinity)
+                        .padding(.vertical, 10)
+                        .background(Color.red.opacity(0.1))
+                        .clipShape(RoundedRectangle(cornerRadius: 8))
                 }
                 .buttonStyle(.plain)
             }
         }
-        .padding(.horizontal, 10)
-        .padding(.vertical, 8)
-        .background(Color.white.opacity(0.04))
-        .clipShape(RoundedRectangle(cornerRadius: 6))
+        .padding(16)
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 16))
         .overlay(
-            RoundedRectangle(cornerRadius: 6)
-                .stroke(Color.white.opacity(0.08), lineWidth: 0.5)
+            RoundedRectangle(cornerRadius: 16)
+                .strokeBorder(color.opacity(0.3), lineWidth: 1)
         )
     }
 
-    private func formatTime(_ seconds: Double) -> String {
-        let s = max(0, Int(seconds.rounded()))
-        let m = s / 60
-        let r = s % 60
-        return String(format: "%02d:%02d", m, r)
+    @ViewBuilder
+    private var statusIcon: some View {
+        if task.status == .running {
+            Image(systemName: "waveform.circle.fill")
+                .foregroundStyle(.blue)
+                .symbolEffect(.variableColor.iterative)
+        } else {
+            Image(systemName: "pause.circle.fill")
+                .foregroundStyle(.orange)
+        }
     }
 }
 
+// MARK: - Compact Task Card
+
+private struct CompactTaskCard: View {
+    let task: TransceiverViewModel.BackgroundAnalysisTask
+
+    var body: some View {
+        HStack(spacing: 12) {
+            statusIcon
+                .font(.title3)
+
+            VStack(alignment: .leading, spacing: 2) {
+                Text(task.title)
+                    .font(.subheadline.weight(.medium))
+                Text(relativeTimestamp(task.createdAt))
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+
+            Spacer()
+
+            trailingContent
+        }
+        .padding(12)
+        .background(Color(.systemGray6))
+        .clipShape(RoundedRectangle(cornerRadius: 12))
+    }
+
+    @ViewBuilder
+    private var statusIcon: some View {
+        switch task.status {
+        case .pending:
+            Image(systemName: "clock")
+                .foregroundStyle(.secondary)
+        case .completed:
+            Image(systemName: "checkmark.circle.fill")
+                .foregroundStyle(.green)
+        case .cancelled:
+            Image(systemName: "xmark.circle.fill")
+                .foregroundStyle(.red)
+        default:
+            Image(systemName: "circle")
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    @ViewBuilder
+    private var trailingContent: some View {
+        switch task.status {
+        case .pending:
+            Text("Queued")
+                .font(.caption.weight(.medium))
+                .foregroundStyle(.secondary)
+        case .completed:
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("Done")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.green)
+                Text(task.signalCount > 0
+                     ? "\(task.signalCount) signal\(task.signalCount == 1 ? "" : "s")"
+                     : "No signals")
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        case .cancelled:
+            VStack(alignment: .trailing, spacing: 2) {
+                Text("Cancelled")
+                    .font(.caption.weight(.medium))
+                    .foregroundStyle(.red)
+                Text(String(format: "%.0f%% completed", task.progress * 100))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.secondary)
+            }
+        default:
+            EmptyView()
+        }
+    }
+}
+
+// MARK: - Helpers
+
+private func relativeTimestamp(_ date: Date) -> String {
+    let calendar = Calendar.current
+    let timeFormatter = DateFormatter()
+    timeFormatter.dateFormat = "HH:mm"
+    let timeString = timeFormatter.string(from: date)
+
+    if calendar.isDateInToday(date) {
+        return "Today \(timeString)"
+    } else if calendar.isDateInYesterday(date) {
+        return "Yesterday \(timeString)"
+    } else {
+        let dayFormatter = DateFormatter()
+        dayFormatter.dateFormat = "MMM d"
+        return "\(dayFormatter.string(from: date)), \(timeString)"
+    }
+}
+
+private func formatDuration(_ seconds: Double) -> String {
+    let s = max(0, Int(seconds.rounded()))
+    if s == 0 { return "--:--" }
+    let m = s / 60
+    let r = s % 60
+    return String(format: "%d:%02d", m, r)
+}
+
+private func formatETA(_ seconds: Double) -> String {
+    let s = max(0, Int(seconds.rounded()))
+    if s == 0 { return "almost done" }
+    let m = s / 60
+    let r = s % 60
+    return String(format: "~%d:%02d left", m, r)
+}
+
 #Preview {
-    TransceiverView(reporter: FreeDVReporter(), powerManager: PowerManager())
+    TransceiverView(reporter: FreeDVReporter())
 }

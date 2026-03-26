@@ -69,8 +69,9 @@ class LogManager: ObservableObject {
         if !backgroundMode {
             DispatchQueue.main.async {
                 self.lines.append(entry)
-                if self.lines.count > self.maxLines {
-                    self.lines.removeFirst(self.lines.count - self.maxLines)
+                let excess = self.lines.count - self.maxLines
+                if excess > 0 {
+                    self.lines.removeFirst(excess)
                 }
             }
         }

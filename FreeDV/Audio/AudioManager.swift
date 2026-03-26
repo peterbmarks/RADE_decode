@@ -52,6 +52,7 @@ class AudioManager: ObservableObject {
     @Published var deferredDecodePaused = false
     @Published var deferredDecodeScannedSeconds: Double = 0
     @Published var deferredDecodeETASeconds: Double = 0
+    @Published var deferredDecodeSignalCount: Int = 0
     
     // FFT spectrum data (dB magnitude, 512 bins covering 0-4kHz at 8kHz sample rate)
     @Published var fftData: [Float] = Array(repeating: -100, count: 512)
@@ -78,6 +79,9 @@ class AudioManager: ObservableObject {
     private var backgroundRxChunkCount = 0
     /// Last RX chunk timestamp in background.
     private var backgroundRxChunkLastDate: Date?
+    /// Set to true when raw samples are captured in background (deferred decode path).
+    /// Reset before each background session; checked on return to foreground.
+    var hadRawSampleCapture = false
     
     // Decoded callsign from EOO
     @Published var decodedCallsign: String = ""
@@ -137,6 +141,7 @@ class AudioManager: ObservableObject {
     private var deferredDecodeCancelRequested = false
     private var deferredDecodeActive = false
     private var deferredReplayFastMode = false
+    private var deferredSessionCounter = 0  // Sessions found during deferred decode
     private let realtimeDecodeControlLock = NSLock()
     private var realtimeDecodePaused = false
     /// Backpressure gate for RX processing queue to prevent unbounded task buildup.
@@ -172,6 +177,8 @@ class AudioManager: ObservableObject {
     private let unsyncGracePeriod: TimeInterval = 3.0
     /// Whether a session is currently active (may persist through brief sync drops)
     private var sessionActive = false
+    /// Real end time captured at first sync-loss frame (before grace delay).
+    private var pendingSessionEndTime: Date?
     
     #if os(iOS)
     /// Background task identifier — buys extra time during app→background transition
@@ -240,6 +247,37 @@ class AudioManager: ObservableObject {
         }
     }
 
+    /// Advance to a new batch file so new background captures don't corrupt
+    /// a paused deferred decode's data.
+    func advanceDeferredSampleBatch() {
+        deferredSampleStore.advanceBatch()
+    }
+
+    /// Number of deferred sample batch files on disk (includes those being drained).
+    var pendingDeferredBatchCount: Int {
+        deferredSampleStore.pendingBatchIndices().count
+    }
+
+    /// Sample count of the most recently captured deferred batch.
+    var latestDeferredBatchSampleCount: Int {
+        deferredSampleStore.latestBatchSampleCount()
+    }
+
+    /// Remove the latest deferred batch file (e.g. too short to be worth decoding).
+    func removeLatestDeferredBatch() {
+        deferredSampleStore.removeLatestBatch()
+    }
+
+    /// Remove a specific deferred batch file by index.
+    func removeDeferredBatch(at index: Int) {
+        deferredSampleStore.removeBatch(at: index)
+    }
+
+    /// The batch index of the most recently written deferred sample file.
+    var latestPendingBatchIndex: Int? {
+        deferredSampleStore.pendingBatchIndices().last
+    }
+
     func setDeferredDecodePaused(_ paused: Bool) {
         deferredDecodeControlLock.lock()
         guard deferredDecodeActive else {
@@ -286,6 +324,13 @@ class AudioManager: ObservableObject {
         return paused
     }
 
+    private func isDeferredDecodeActiveNow() -> Bool {
+        deferredDecodeControlLock.lock()
+        let active = deferredDecodeActive
+        deferredDecodeControlLock.unlock()
+        return active
+    }
+
     func decodeDeferredSamples(chunkSamples: Int = 32000) {
         deferredDecodeQueue.async { [weak self] in
             guard let self = self else { return }
@@ -306,6 +351,7 @@ class AudioManager: ObservableObject {
             self.deferredDecodePauseRequested = false
             self.deferredDecodeCancelRequested = false
             self.deferredDecodeControlLock.unlock()
+            self.deferredSessionCounter = 0
             defer {
                 self.deferredDecodeControlLock.lock()
                 self.deferredDecodeActive = false
@@ -334,6 +380,7 @@ class AudioManager: ObservableObject {
             self.deferredReplayFastMode = true
             self.radeWrapper.rxDiagnosticLoggingEnabled = false
             self.setRealtimeDecodePaused(true)
+            self.receptionLogger?.deferPersistence = true
             defer {
                 self.deferredReplayFastMode = previousFastMode
                 self.radeWrapper.rxDiagnosticLoggingEnabled = previousRxDiag
@@ -359,6 +406,7 @@ class AudioManager: ObservableObject {
                 self.deferredDecodePaused = false
                 self.deferredDecodeScannedSeconds = 0
                 self.deferredDecodeETASeconds = 0
+                self.deferredDecodeSignalCount = 0
             }
 
             self.radeWrapper.clearInputBuffer()
@@ -390,10 +438,12 @@ class AudioManager: ObservableObject {
                     let remaining = max(0, totalDecodeSamples - processedDecodeSamples)
                     let eta = rate > 0 ? Double(remaining) / rate : 0
                     let scannedSeconds = Double(processedDecodeSamples) / 8000.0
+                    let liveSessionCount = self.deferredSessionCounter
                     DispatchQueue.main.async {
                         self.deferredDecodeProgress = progress
                         self.deferredDecodeScannedSeconds = scannedSeconds
                         self.deferredDecodeETASeconds = eta
+                        self.deferredDecodeSignalCount = liveSessionCount
                     }
                     lastUIUpdate = now
                 }
@@ -406,8 +456,19 @@ class AudioManager: ObservableObject {
                 }
             )
 
+            let finalSessionCount = self.deferredSessionCounter
+
+            // Finalize any in-progress session before handling completion
+            if self.sessionActive {
+                self.finalizeCurrentSession()
+            }
+
             if cancelled {
+                // Discard any sessions decoded before cancellation
+                self.receptionLogger?.discardDeferredSessions()
+                self.receptionLogger?.deferPersistence = false
                 DispatchQueue.main.async {
+                    self.deferredDecodeSignalCount = finalSessionCount
                     self.deferredDecodeInProgress = false
                     self.deferredDecodePaused = false
                     self.deferredDecodeStatusText = ""
@@ -416,7 +477,12 @@ class AudioManager: ObservableObject {
                 return
             }
 
+            // Flush all deferred sessions to SwiftData now that decode is complete
+            self.receptionLogger?.flushDeferredSessions()
+            self.receptionLogger?.deferPersistence = false
+
             DispatchQueue.main.async {
+                self.deferredDecodeSignalCount = finalSessionCount
                 self.deferredDecodeProgress = 1.0
                 self.deferredDecodeInProgress = false
                 self.deferredDecodeStatusText = ""
@@ -720,9 +786,14 @@ class AudioManager: ObservableObject {
                 object: audioEngine
             )
             
-            appLog("Audio session: mode=\(session.mode.rawValue) sampleRate=\(session.sampleRate) inputGainSettable=\(session.isInputGainSettable) inputGain=\(session.inputGain)")
+            appLog("Audio session: category=\(session.category.rawValue) mode=\(session.mode.rawValue) sampleRate=\(session.sampleRate) inputGainSettable=\(session.isInputGainSettable) inputGain=\(session.inputGain)")
+            
+            // Verify the category is .playAndRecord — this category overrides the mute switch.
+            if session.category != .playAndRecord {
+                appLog("WARN: category is \(session.category.rawValue), not playAndRecord — mute switch may suppress audio")
+            }
         } catch {
-            print("Audio session setup failed: \(error)")
+            appLog("Audio session setup failed: \(error)")
         }
         #endif
     }
@@ -753,7 +824,7 @@ class AudioManager: ObservableObject {
         radeWrapper.onDecodedAudio = { [weak self] samples, count in
             guard let self = self, let samples = samples else { return }
             self.wavRecorder?.writeSamples(samples, count: Int(count))
-            if !self.backgroundMode {
+            if !self.backgroundMode && !self.deferredReplayFastMode {
                 self.playDecodedAudio(samples: samples, count: Int(count))
             }
         }
@@ -779,19 +850,21 @@ class AudioManager: ObservableObject {
             guard let callsign = callsign else { return }
             let currentSNR = self?.snr ?? 0
             let frameCount = self?.receptionLogger?.currentSession?.totalModemFrames ?? 0
+            let isDeferredReplay = self?.deferredReplayFastMode ?? false
             // Skip main thread dispatch in background / deferred replay fast mode.
-            if !(self?.backgroundMode ?? false) && !(self?.deferredReplayFastMode ?? false) {
+            if !(self?.backgroundMode ?? false) && !isDeferredReplay {
                 DispatchQueue.main.async {
                     self?.decodedCallsign = callsign
                 }
             }
-            // Record callsign event with GPS location
-            let lat = self?.locationTracker.latitude
-            let lon = self?.locationTracker.longitude
+            // For deferred background replay, coordinates are unknown at capture time.
+            // Persist nil so Reception Log / Map do not show misleading positions.
+            let lat = isDeferredReplay ? nil : self?.locationTracker.latitude
+            let lon = isDeferredReplay ? nil : self?.locationTracker.longitude
             self?.receptionLogger?.recordCallsign(callsign, snr: currentSNR, modemFrame: frameCount,
                                                    latitude: lat, longitude: lon)
             // Report to FreeDV Reporter (qso.freedv.org)
-            if !(self?.deferredReplayFastMode ?? false) {
+            if !isDeferredReplay {
                 self?.reporter?.reportRx(callsign: callsign, snr: Int(currentSNR))
             }
         }
@@ -816,6 +889,7 @@ class AudioManager: ObservableObject {
                     // Cancel any pending session-end timer
                     self.unsyncGraceTimer?.cancel()
                     self.unsyncGraceTimer = nil
+                    self.pendingSessionEndTime = nil
                     
                     // Start a new session if none is active
                     if !self.sessionActive {
@@ -827,6 +901,7 @@ class AudioManager: ObservableObject {
                 } else if self.sessionActive && self.unsyncGraceTimer == nil {
                     // Sync lost — start grace period timer instead of ending immediately.
                     // Brief sync drops (fading, noise bursts) won't split the session.
+                    self.pendingSessionEndTime = Date()
                     let timer = DispatchWorkItem { [weak self] in
                         guard let self = self, self.shouldProcess else { return }
                         self.finalizeCurrentSession()
@@ -889,9 +964,10 @@ class AudioManager: ObservableObject {
             receptionLogger?.currentSession?.audioFileSize = fileSize
             wavRecorder = nil
         }
-        receptionLogger?.endSession()
+        receptionLogger?.endSession(endTime: pendingSessionEndTime)
         sessionStartTime = nil
         sessionActive = false
+        pendingSessionEndTime = nil
         unsyncGraceTimer?.cancel()
         unsyncGraceTimer = nil
         appLog("AudioManager: session finalized (sync lost for >\(unsyncGracePeriod)s)")
@@ -902,6 +978,8 @@ class AudioManager: ObservableObject {
     private func beginNewSubSession() {
         sessionActive = true
         sessionStartTime = Date()
+        pendingSessionEndTime = nil
+        if deferredReplayFastMode { deferredSessionCounter += 1 }
         
         let deviceName: String
         #if os(iOS)
@@ -912,8 +990,8 @@ class AudioManager: ObservableObject {
         
         receptionLogger?.beginSession(audioDevice: deviceName, sampleRate: currentSampleRate)
         
-        // Record GPS location if available
-        if let loc = locationTracker.currentLocation {
+        // Record GPS location if available (skip during deferred replay — location is unknown)
+        if !deferredReplayFastMode, let loc = locationTracker.currentLocation {
             receptionLogger?.currentSession?.startLatitude = loc.coordinate.latitude
             receptionLogger?.currentSession?.startLongitude = loc.coordinate.longitude
             receptionLogger?.currentSession?.startAltitude = loc.altitude
@@ -970,9 +1048,26 @@ class AudioManager: ObservableObject {
         
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
-        try? session.setCategory(.playAndRecord, mode: .default,
-                                  options: [.allowBluetooth, .defaultToSpeaker])
-        try? session.setActive(true)
+        do {
+            try session.setCategory(.playAndRecord, mode: .default,
+                                      options: [.allowBluetooth, .defaultToSpeaker])
+        } catch {
+            appLog("WARN: setCategory failed: \(error) — retrying without bluetooth")
+            try? session.setCategory(.playAndRecord, mode: .default,
+                                      options: [.defaultToSpeaker])
+        }
+        do {
+            try session.setActive(true)
+        } catch {
+            appLog("WARN: setActive failed: \(error)")
+        }
+        // Verify the category is actually .playAndRecord (overrides mute switch).
+        // If setCategory silently fell back to .soloAmbient, audio won't play when muted.
+        if session.category != .playAndRecord {
+            appLog("WARN: audio session category is \(session.category.rawValue), expected playAndRecord — forcing")
+            try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+            try? session.setActive(true)
+        }
         applyFixedInputGain()
         #endif
         
@@ -1066,9 +1161,12 @@ class AudioManager: ObservableObject {
     }
     
     func stop() {
-        cancelDeferredDecode()
+        let keepDeferredReplayRunning = isDeferredDecodeActiveNow()
+        if !keepDeferredReplayRunning {
+            cancelDeferredDecode()
+        }
         // Signal processingQueue to skip pending work items immediately
-        shouldProcess = false
+        shouldProcess = keepDeferredReplayRunning
         setDeferredFeatureStorageEnabled(false)
         backgroundRawSampleCaptureEnabled = false
         processingBackpressureLock.lock()
@@ -1078,7 +1176,12 @@ class AudioManager: ObservableObject {
         isModemSyncedForBackground = false
         backgroundDecodeBoostUntil = nil
         processingBackpressureLock.unlock()
-        deferredSampleStore.reset()
+        if !keepDeferredReplayRunning {
+            deferredSampleStore.reset()
+            // Ensure deferred replay work has observed cancellation before teardown.
+            // Without this, STOP can race with foreground replay and hit RADE state conflicts.
+            deferredDecodeQueue.sync {}
+        }
         
         // Stop health monitoring
         stopHealthCheckTimer()
@@ -1106,6 +1209,11 @@ class AudioManager: ObservableObject {
         unsyncGraceTimer = nil
         
         processingQueue.async { [weak self] in
+            if keepDeferredReplayRunning {
+                // Keep deferred replay path alive; only stop real-time RX side.
+                tracker.stopTracking()
+                return
+            }
             // Clear RADE internal buffers so stale data doesn't carry over
             wrapper.clearInputBuffer()
             wrapper.resetFargan()
@@ -1117,13 +1225,14 @@ class AudioManager: ObservableObject {
                     logger?.currentSession?.audioFileSize = fileSize
                     self.wavRecorder = nil
                 }
-                logger?.endSession()
+                logger?.endSession(endTime: self?.pendingSessionEndTime)
             }
             
             if let self = self {
                 self.sessionStartTime = nil
                 self.previousRxSyncInt = 0
                 self.sessionActive = false
+                self.pendingSessionEndTime = nil
             }
             tracker.stopTracking()
         }
@@ -1145,9 +1254,14 @@ class AudioManager: ObservableObject {
         guard let converter = rxConverter,
               let monoFmt = monoFloatFormat else { return }
         
+        // Background raw capture must run even when real-time decode is paused
+        // (e.g. during a deferred foreground replay). Without this, going to
+        // background while a replay is paused would capture nothing.
+        let needsRawCapture = backgroundMode && backgroundRawSampleCaptureEnabled
+        
         // During deferred foreground replay, pause real-time decode work entirely.
-        // This avoids spending CPU on conversion/backpressure logic that will be dropped anyway.
-        if isRealtimeDecodePaused() {
+        // But still allow conversion when background raw capture is needed.
+        if isRealtimeDecodePaused() && !needsRawCapture {
             return
         }
         
@@ -1255,12 +1369,13 @@ class AudioManager: ObservableObject {
         }
 
         // Background low-load mode: store raw modem-band samples and defer decode.
-        if backgroundMode && backgroundRawSampleCaptureEnabled {
+        if needsRawCapture {
+            hadRawSampleCapture = true
             deferredSampleStore.appendRawInt16(samples, count: convertedCount)
             return
         }
         
-        // Foreground deferred replay in progress: pause real-time decode/FFT to keep app smooth.
+        // After raw capture check, enforce the real-time pause.
         if isRealtimeDecodePaused() {
             return
         }
@@ -1400,6 +1515,7 @@ class AudioManager: ObservableObject {
         while fftAccumBuffer.count >= fftSize {
             computeFFT(Array(fftAccumBuffer.prefix(fftSize)))
             // No overlap — saves ~50% FFT CPU
+            guard fftAccumBuffer.count >= fftSize else { break }
             fftAccumBuffer.removeFirst(fftSize)
         }
     }
@@ -1509,10 +1625,14 @@ class AudioManager: ObservableObject {
             if options.contains(.shouldResume) && isRunning {
                 appLog("Resuming audio engine after interruption")
                 do {
-                    try AVAudioSession.sharedInstance().setActive(true)
+                    let session = AVAudioSession.sharedInstance()
+                    // Re-apply category to ensure .playAndRecord (overrides mute switch)
+                    try session.setCategory(.playAndRecord, mode: .default,
+                                              options: [.allowBluetooth, .defaultToSpeaker])
+                    try session.setActive(true)
                     try audioEngine.start()
                     applyFixedInputGain()
-                    appLog("Audio engine resumed successfully")
+                    appLog("Audio engine resumed successfully (category=\(session.category.rawValue))")
                 } catch {
                     appLog("Failed to resume audio engine: \(error)")
                 }

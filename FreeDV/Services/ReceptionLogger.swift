@@ -17,6 +17,14 @@ class ReceptionLogger {
     private var snrSum: Float = 0
     private var snrCount: Int = 0
     
+    /// When true, endSession() buffers completed sessions instead of persisting.
+    /// Used during deferred decode so log entries only appear after the full decode finishes.
+    var deferPersistence = false
+    
+    /// Sessions waiting to be persisted (accumulated while deferPersistence is true).
+    private var deferredSessions: [(session: ReceptionSession, snapshots: [SignalSnapshot],
+                                    syncEvents: [SyncEvent], callsignEvents: [CallsignEvent])] = []
+    
     /// Minimum synced frames required to keep a session.
     /// At ~8 frames/sec, 4 frames ≈ 0.5 seconds — filters only very brief false syncs.
     private let minSyncedFrames = 4
@@ -44,10 +52,10 @@ class ReceptionLogger {
         appLog("ReceptionLogger: session started, device=\(audioDevice)")
     }
     
-    func endSession() {
+    func endSession(endTime: Date? = nil) {
         guard let session = currentSession else { return }
         
-        session.endTime = Date()
+        session.endTime = endTime ?? Date()
         
         // Calculate average SNR from synced frames
         if snrCount > 0 {
@@ -72,18 +80,17 @@ class ReceptionLogger {
             }
         }
         
+        // When deferring, stash the session and buffers for later persistence
+        if deferPersistence {
+            deferredSessions.append((session: session, snapshots: snapshotBuffer,
+                                     syncEvents: syncEventBuffer, callsignEvents: callsignEventBuffer))
+            appLog("ReceptionLogger: session deferred, frames=\(session.totalModemFrames) (total deferred: \(deferredSessions.count))")
+            cleanup()
+            return
+        }
+        
         // Persist session and all buffered data to SwiftData
-        modelContext.insert(session)
-        for snap in snapshotBuffer {
-            modelContext.insert(snap)
-        }
-        for event in syncEventBuffer {
-            modelContext.insert(event)
-        }
-        for event in callsignEventBuffer {
-            modelContext.insert(event)
-        }
-        try? modelContext.save()
+        persistSession(session, snapshots: snapshotBuffer, syncEvents: syncEventBuffer, callsignEvents: callsignEventBuffer)
         
         appLog("ReceptionLogger: session saved, frames=\(session.totalModemFrames) syncRatio=\(String(format: "%.1f%%", session.syncRatio * 100))")
         cleanup()
@@ -148,7 +155,53 @@ class ReceptionLogger {
         appLog("ReceptionLogger: callsign decoded: \(callsign) SNR=\(snr)")
     }
     
+    // MARK: - Deferred Persistence
+    
+    /// Persist all deferred sessions to SwiftData at once.
+    /// Called when the entire deferred decode finishes successfully.
+    func flushDeferredSessions() {
+        guard !deferredSessions.isEmpty else { return }
+        let count = deferredSessions.count
+        for entry in deferredSessions {
+            persistSession(entry.session, snapshots: entry.snapshots,
+                           syncEvents: entry.syncEvents, callsignEvents: entry.callsignEvents)
+        }
+        deferredSessions.removeAll()
+        appLog("ReceptionLogger: flushed \(count) deferred sessions")
+    }
+    
+    /// Discard all deferred sessions and their WAV files.
+    /// Called when deferred decode is cancelled.
+    func discardDeferredSessions() {
+        for entry in deferredSessions {
+            if let filename = entry.session.audioFilename {
+                let url = WAVRecorder.recordingsDirectory.appendingPathComponent(filename)
+                try? FileManager.default.removeItem(at: url)
+            }
+        }
+        let count = deferredSessions.count
+        deferredSessions.removeAll()
+        if count > 0 {
+            appLog("ReceptionLogger: discarded \(count) deferred sessions")
+        }
+    }
+    
     // MARK: - Private
+    
+    private func persistSession(_ session: ReceptionSession, snapshots: [SignalSnapshot],
+                                syncEvents: [SyncEvent], callsignEvents: [CallsignEvent]) {
+        modelContext.insert(session)
+        for snap in snapshots {
+            modelContext.insert(snap)
+        }
+        for event in syncEvents {
+            modelContext.insert(event)
+        }
+        for event in callsignEvents {
+            modelContext.insert(event)
+        }
+        try? modelContext.save()
+    }
     
     private func discardSession() {
         // Delete WAV file if one was created

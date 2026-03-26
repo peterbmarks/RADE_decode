@@ -4,13 +4,12 @@ import Combine
 
 struct ContentView: View {
     @State private var reporter = FreeDVReporter()
-    @State private var powerManager = PowerManager()
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @State private var showOnboarding = false
     
     var body: some View {
         TabView {
-            TransceiverView(reporter: reporter, powerManager: powerManager)
+            TransceiverView(reporter: reporter)
                 .tabItem {
                     Label("Receiver", systemImage: "antenna.radiowaves.left.and.right")
                 }
@@ -33,7 +32,7 @@ struct ContentView: View {
             }
             
             NavigationStack {
-                SettingsView(reporter: reporter, powerManager: powerManager)
+                SettingsView(reporter: reporter)
             }
             .tabItem {
                 Label("Settings", systemImage: "gear")
