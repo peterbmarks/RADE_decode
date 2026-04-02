@@ -56,8 +56,9 @@ class TransceiverViewModel: ObservableObject {
     @Published var currentInputDevice: String = "Unknown"
     @Published var currentOutputDevice: String = "Unknown"
     
-    // Callsign
+    // Callsign (auto-clears after 10 seconds)
     @Published var decodedCallsign: String = ""
+    private var callsignDismissTask: Task<Void, Never>?
     
     // Output volume (0.0 ~ 1.0)
     @Published var outputVolume: Float = 1.0 {
@@ -151,10 +152,17 @@ class TransceiverViewModel: ObservableObject {
                 self.deferredDecodeETASeconds = self.audioManager.deferredDecodeETASeconds
                 self.syncBackgroundAnalysisTasks()
                 
-                // Update decoded callsign from EOO.
+                // Update decoded callsign from EOO (auto-dismiss after 10s).
                 let newCallsign = self.audioManager.decodedCallsign
                 if !newCallsign.isEmpty && newCallsign != self.decodedCallsign {
                     self.decodedCallsign = newCallsign
+                    self.callsignDismissTask?.cancel()
+                    self.callsignDismissTask = Task {
+                        try? await Task.sleep(for: .seconds(10))
+                        guard !Task.isCancelled else { return }
+                        withAnimation { self.decodedCallsign = "" }
+                        self.audioManager.decodedCallsign = ""
+                    }
                 }
             }
         }

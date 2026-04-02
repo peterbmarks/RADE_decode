@@ -62,9 +62,10 @@ class ReceptionLogger {
             session.avgSNR = snrSum / Float(snrCount)
         }
         
-        // Discard session if too few synced frames (likely false sync)
-        if session.syncedFrames < minSyncedFrames {
-            appLog("ReceptionLogger: session discarded (syncedFrames=\(session.syncedFrames) < \(minSyncedFrames))")
+        // Discard session if too few synced frames (likely false sync),
+        // but keep it if at least one callsign was decoded.
+        if session.syncedFrames < minSyncedFrames && callsignEventBuffer.isEmpty {
+            appLog("ReceptionLogger: session discarded (syncedFrames=\(session.syncedFrames) < \(minSyncedFrames), no callsign)")
             discardSession()
             return
         }
@@ -133,13 +134,19 @@ class ReceptionLogger {
     /// Record a callsign decode event with optional GPS location.
     func recordCallsign(_ callsign: String, snr: Float, modemFrame: Int,
                          latitude: Double? = nil, longitude: Double? = nil) {
+        let normalizedCallsign = callsign
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .components(separatedBy: .controlCharacters)
+            .joined()
+            .uppercased()
+        guard !normalizedCallsign.isEmpty else { return }
         guard let session = currentSession else { return }
         
         let offsetMs = Int64(Date().timeIntervalSince(session.startTime) * 1000)
         let event = CallsignEvent(
             timestamp: Date(),
             offsetMs: offsetMs,
-            callsign: callsign,
+            callsign: normalizedCallsign,
             snrAtDecode: snr,
             modemFrame: modemFrame
         )
@@ -148,11 +155,11 @@ class ReceptionLogger {
         event.session = session
         callsignEventBuffer.append(event)
         
-        if !session.callsignsDecoded.contains(callsign) {
-            session.callsignsDecoded.append(callsign)
+        if !session.callsignsDecoded.contains(normalizedCallsign) {
+            session.callsignsDecoded.append(normalizedCallsign)
         }
         
-        appLog("ReceptionLogger: callsign decoded: \(callsign) SNR=\(snr)")
+        appLog("ReceptionLogger: callsign decoded: \(normalizedCallsign) SNR=\(snr)")
     }
     
     // MARK: - Deferred Persistence

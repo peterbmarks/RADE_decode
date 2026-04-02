@@ -665,7 +665,7 @@ bool EooCallsignDecoder::decode(const float *syms, int symSize,
     int     parityChecks = 0;
 
     eoo_symbols_to_llrs(llr, pending, amps, /*EsNo=*/3.0f, rms, 56);
-    eoo_run_ldpc_decoder(decoded, llr, &parityChecks);
+    int ldpcIter = eoo_run_ldpc_decoder(decoded, llr, &parityChecks);
 
     // --- Step 4: BER gate (threshold 0.2, matching rade_text_rx) ----------
     const float ber = static_cast<float>(kNumParityBits - parityChecks)

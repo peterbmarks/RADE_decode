@@ -230,6 +230,20 @@ struct ShareSheet: UIViewControllerRepresentable {
 struct SessionSummaryCard: View {
     let session: ReceptionSession
     
+    private var displayedCallsigns: [String] {
+        guard session.modelContext != nil else { return [] }
+        let fromEvents = session.callsignEvents
+            .map(\.callsign)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !fromEvents.isEmpty {
+            return Array(NSOrderedSet(array: fromEvents)) as? [String] ?? fromEvents
+        }
+        return session.callsignsDecoded
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 10) {
             // Time info
@@ -293,13 +307,13 @@ struct SessionSummaryCard: View {
             }
             
             // Callsigns
-            if !session.callsignsDecoded.isEmpty {
+            if !displayedCallsigns.isEmpty {
                 Divider()
                 HStack(spacing: 4) {
                     Image(systemName: "antenna.radiowaves.left.and.right")
                         .font(.system(size: 12))
                         .foregroundStyle(.green)
-                    Text(session.callsignsDecoded.joined(separator: ", "))
+                    Text(displayedCallsigns.joined(separator: ", "))
                         .font(.system(size: 14, weight: .bold, design: .monospaced))
                         .foregroundStyle(.green)
                 }

@@ -66,7 +66,7 @@ struct TransceiverView: View {
                         .padding(.horizontal, 16)
                         .padding(.top, 12)
                         
-                        // Decoded callsign banner
+                        // Decoded callsign banner (auto-dismisses after 10s)
                         if !viewModel.decodedCallsign.isEmpty {
                             HStack(spacing: 6) {
                                 Image(systemName: "antenna.radiowaves.left.and.right")
@@ -81,6 +81,7 @@ struct TransceiverView: View {
                             .background(Color.green.opacity(0.1))
                             .clipShape(RoundedRectangle(cornerRadius: 8))
                             .padding(.top, 10)
+                            .transition(.opacity.combined(with: .scale(scale: 0.9)))
                         }
                         
                         Spacer()

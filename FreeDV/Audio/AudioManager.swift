@@ -847,28 +847,88 @@ class AudioManager: ObservableObject {
         
         // Callsign decoded from EOO frame
         radeWrapper.onCallsignDecoded = { [weak self] callsign in
-            guard let callsign = callsign else { return }
-            let currentSNR = self?.snr ?? 0
-            let frameCount = self?.receptionLogger?.currentSession?.totalModemFrames ?? 0
-            let isDeferredReplay = self?.deferredReplayFastMode ?? false
+            guard let self = self, let callsign = callsign else { return }
+            let normalizedCallsign = callsign
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+                .components(separatedBy: .controlCharacters)
+                .joined()
+                .uppercased()
+            guard !normalizedCallsign.isEmpty else {
+                appLog("EOO callsign decode returned empty/whitespace")
+                return
+            }
+            if self.receptionLogger?.currentSession == nil {
+                // EOO may arrive near a session boundary. Ensure we always have
+                // a session container so the callsign event is persisted.
+                let deviceName: String
+                #if os(iOS)
+                deviceName = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? "Unknown"
+                #else
+                deviceName = "Unknown"
+                #endif
+                self.receptionLogger?.beginSession(audioDevice: deviceName, sampleRate: self.currentSampleRate)
+                self.sessionActive = true
+                self.sessionStartTime = Date()
+                self.pendingSessionEndTime = nil
+                appLog("AudioManager: created callsign-only session")
+            }
+
+            let currentSNR = self.snr
+            let frameCount = self.receptionLogger?.currentSession?.totalModemFrames ?? 0
+            let isDeferredReplay = self.deferredReplayFastMode
+            let logMessage = String(format: "EOO callsign decoded: %@ (SNR=%.1f dB)", normalizedCallsign, currentSNR)
+
+            if self.backgroundMode || isDeferredReplay {
+                bgLog(logMessage)
+            } else {
+                appLog(logMessage)
+            }
+
             // Skip main thread dispatch in background / deferred replay fast mode.
-            if !(self?.backgroundMode ?? false) && !isDeferredReplay {
+            if !self.backgroundMode && !isDeferredReplay {
                 DispatchQueue.main.async {
-                    self?.decodedCallsign = callsign
+                    self.decodedCallsign = normalizedCallsign
                 }
             }
             // For deferred background replay, coordinates are unknown at capture time.
             // Persist nil so Reception Log / Map do not show misleading positions.
-            let lat = isDeferredReplay ? nil : self?.locationTracker.latitude
-            let lon = isDeferredReplay ? nil : self?.locationTracker.longitude
-            self?.receptionLogger?.recordCallsign(callsign, snr: currentSNR, modemFrame: frameCount,
-                                                   latitude: lat, longitude: lon)
+            let lat = isDeferredReplay ? nil : self.locationTracker.latitude
+            let lon = isDeferredReplay ? nil : self.locationTracker.longitude
+            self.receptionLogger?.recordCallsign(normalizedCallsign, snr: currentSNR, modemFrame: frameCount,
+                                                 latitude: lat, longitude: lon)
             // Report to FreeDV Reporter (qso.freedv.org)
             if !isDeferredReplay {
-                self?.reporter?.reportRx(callsign: callsign, snr: Int(currentSNR))
+                self.reporter?.reportRx(callsign: normalizedCallsign, snr: Int(currentSNR))
             }
         }
-        
+
+        // EOO detected regardless of callsign decode success.
+        radeWrapper.onEooDetected = { [weak self] callsign in
+            guard let self = self else { return }
+            if callsign != nil { return }
+
+            if self.receptionLogger?.currentSession == nil {
+                let deviceName: String
+                #if os(iOS)
+                deviceName = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? "Unknown"
+                #else
+                deviceName = "Unknown"
+                #endif
+                self.receptionLogger?.beginSession(audioDevice: deviceName, sampleRate: self.currentSampleRate)
+                self.sessionActive = true
+                self.sessionStartTime = Date()
+                self.pendingSessionEndTime = nil
+                appLog("AudioManager: created EOO-only session")
+            }
+
+            let frameCount = self.receptionLogger?.currentSession?.totalModemFrames ?? 0
+            let isDeferredReplay = self.deferredReplayFastMode
+            let lat = isDeferredReplay ? nil : self.locationTracker.latitude
+            let lon = isDeferredReplay ? nil : self.locationTracker.longitude
+            self.receptionLogger?.recordCallsign("EOO-DETECTED", snr: self.snr, modemFrame: frameCount,
+                                                 latitude: lat, longitude: lon)
+        }
+
         // Modem frame processed — detect sync transitions and record snapshots
         radeWrapper.onModemFrameProcessed = { [weak self] snr, freqOffset, syncState, nin in
             guard let self = self else { return }

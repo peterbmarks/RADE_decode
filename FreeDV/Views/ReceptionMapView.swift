@@ -94,17 +94,22 @@ struct ReceptionMapView: View {
 struct SessionMapPin: View {
     let session: ReceptionSession
     
+    private var callsigns: [String] {
+        guard session.modelContext != nil else { return [] }
+        return session.callsignsDecoded
+    }
+
     var body: some View {
         VStack(spacing: 2) {
             Image(systemName: "antenna.radiowaves.left.and.right")
                 .font(.system(size: 14, weight: .bold))
                 .foregroundStyle(.white)
                 .padding(6)
-                .background(session.callsignsDecoded.isEmpty ? Color.yellow : Color.green)
+                .background(callsigns.isEmpty ? Color.yellow : Color.green)
                 .clipShape(Circle())
-            
-            if !session.callsignsDecoded.isEmpty {
-                Text(session.callsignsDecoded.first ?? "")
+
+            if !callsigns.isEmpty {
+                Text(callsigns.first ?? "")
                     .font(.system(size: 9, weight: .bold, design: .monospaced))
                     .foregroundStyle(.green)
             }

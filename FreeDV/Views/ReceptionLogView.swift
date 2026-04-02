@@ -42,16 +42,23 @@ struct ReceptionLogView: View {
     }
     
     private func deleteSessions(at offsets: IndexSet) {
-        for index in offsets {
-            let session = sessions[index]
-            // Delete associated WAV file
-            if let filename = session.audioFilename {
-                let url = WAVRecorder.recordingsDirectory.appendingPathComponent(filename)
-                try? FileManager.default.removeItem(at: url)
+        withAnimation {
+            for index in offsets {
+                let session = sessions[index]
+                // Resolve faulted attributes before deletion to prevent SwiftData crash
+                _ = session.callsignsDecoded
+                _ = session.callsignEvents
+                _ = session.snapshots
+                _ = session.syncEvents
+                // Delete associated WAV file
+                if let filename = session.audioFilename {
+                    let url = WAVRecorder.recordingsDirectory.appendingPathComponent(filename)
+                    try? FileManager.default.removeItem(at: url)
+                }
+                modelContext.delete(session)
             }
-            modelContext.delete(session)
+            try? modelContext.save()
         }
-        try? modelContext.save()
     }
 }
 
@@ -59,6 +66,20 @@ struct ReceptionLogView: View {
 
 struct SessionRowView: View {
     let session: ReceptionSession
+    
+    private var displayedCallsigns: [String] {
+        guard session.modelContext != nil else { return [] }
+        let fromEvents = session.callsignEvents
+            .map(\.callsign)
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+        if !fromEvents.isEmpty {
+            return Array(NSOrderedSet(array: fromEvents)) as? [String] ?? fromEvents
+        }
+        return session.callsignsDecoded
+            .map { $0.trimmingCharacters(in: .whitespacesAndNewlines) }
+            .filter { !$0.isEmpty }
+    }
     
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
@@ -110,12 +131,12 @@ struct SessionRowView: View {
             }
             
             // Bottom line: callsigns (if any)
-            if !session.callsignsDecoded.isEmpty {
+            if !displayedCallsigns.isEmpty {
                 HStack(spacing: 4) {
                     Image(systemName: "antenna.radiowaves.left.and.right")
                         .font(.system(size: 10))
                         .foregroundStyle(.green)
-                    Text(session.callsignsDecoded.joined(separator: ", "))
+                    Text(displayedCallsigns.joined(separator: ", "))
                         .font(.system(size: 12, weight: .medium, design: .monospaced))
                         .foregroundStyle(.green)
                 }

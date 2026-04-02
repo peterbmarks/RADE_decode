@@ -28,6 +28,7 @@ class RADEWrapper {
     var onDecodedAudio: ((_ samples: UnsafePointer<Int16>?, _ count: Int32) -> Void)?
     var onStatusUpdate: ((_ status: RADERxStatus?) -> Void)?
     var onCallsignDecoded: ((_ callsign: String?) -> Void)?
+    var onEooDetected: ((_ callsign: String?) -> Void)?
     var speechSynthesisEnabled = true
     var deferredFeatureStorageEnabled = false
     var rxDiagnosticLoggingEnabled = true
@@ -114,6 +115,7 @@ class RADEWrapper {
     var onDecodedAudio: ((_ samples: UnsafePointer<Int16>?, _ count: Int32) -> Void)?
     var onStatusUpdate: ((_ status: RADERxStatus?) -> Void)?
     var onCallsignDecoded: ((_ callsign: String?) -> Void)?
+    var onEooDetected: ((_ callsign: String?) -> Void)?
 
     /// Disable FARGAN synthesis in background to reduce CPU load.
     var speechSynthesisEnabled = true
@@ -130,8 +132,10 @@ class RADEWrapper {
         // Initialize the RADE library
         rade_initialize()
 
-        // Open RADE context with C encoder and decoder, quiet mode
-        let flags: Int32 = RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_VERBOSE_0
+        // Open RADE context with C encoder and decoder.
+        // Keep verbose logs enabled so EOO detection metrics (endofover, Dtmax12_eoo)
+        // are visible in Xcode console during troubleshooting.
+        let flags: Int32 = RADE_USE_C_ENCODER | RADE_USE_C_DECODER
         var modelPath = Array("built-in".utf8CString)
         radePtr = modelPath.withUnsafeMutableBufferPointer { buf -> OpaquePointer? in
             return rade_open(buf.baseAddress, flags)
@@ -234,18 +238,91 @@ class RADEWrapper {
 
             // Check for EOO callsign
             if hasEoo != 0 && nEooBits > 0 {
-                var callsignBuf = [CChar](repeating: 0, count: 16)
-                let symCount = nEooBits / 2
+                let totalSymCount = nEooBits / 2
+                var decodedCallsign: String?
+
                 let decoded = eooOut.withUnsafeBufferPointer { eooBuf -> Bool in
-                    callsignBuf.withUnsafeMutableBufferPointer { csBuf in
-                        eoo_callsign_decode(eooBuf.baseAddress, Int32(symCount),
-                                           csBuf.baseAddress, Int32(csBuf.count)) != 0
+                    guard let base = eooBuf.baseAddress else { return false }
+
+                    var attempts: [(offsetSymbols: Int, symbolCount: Int)] = []
+                    attempts.append((offsetSymbols: 0, symbolCount: totalSymCount))
+                    attempts.append((offsetSymbols: 0, symbolCount: min(totalSymCount, 56)))
+
+                    if totalSymCount >= 56 {
+                        let maxOffset = min(8, totalSymCount - 56)
+                        if maxOffset > 0 {
+                            for offset in 1...maxOffset {
+                                attempts.append((offsetSymbols: offset, symbolCount: 56))
+                            }
+                        }
                     }
+
+                    for attempt in attempts {
+                        let floatOffset = attempt.offsetSymbols * 2
+                        let floatCount = attempt.symbolCount * 2
+                        guard floatOffset + floatCount <= eooBuf.count else { continue }
+
+                        var callsignBuf = [CChar](repeating: 0, count: 16)
+                        let okDirect = callsignBuf.withUnsafeMutableBufferPointer { csBuf in
+                            eoo_callsign_decode(base.advanced(by: floatOffset),
+                                               Int32(attempt.symbolCount),
+                                               csBuf.baseAddress,
+                                               Int32(csBuf.count)) != 0
+                        }
+
+                        if okDirect {
+                            decodedCallsign = String(cString: callsignBuf)
+                            return true
+                        }
+
+                        // Try constellation phase ambiguity rotations: 90/180/270 deg.
+                        var rotated = [Float](repeating: 0, count: floatCount)
+                        for rotation in 1...3 {
+                            for idx in stride(from: 0, to: floatCount, by: 2) {
+                                let re = base[floatOffset + idx]
+                                let im = base[floatOffset + idx + 1]
+                                let rr: Float
+                                let ii: Float
+                                switch rotation {
+                                case 1: // +90 deg
+                                    rr = -im
+                                    ii = re
+                                case 2: // 180 deg
+                                    rr = -re
+                                    ii = -im
+                                default: // +270 deg
+                                    rr = im
+                                    ii = -re
+                                }
+                                rotated[idx] = rr
+                                rotated[idx + 1] = ii
+                            }
+
+                            callsignBuf = [CChar](repeating: 0, count: 16)
+                            let okRotated = rotated.withUnsafeBufferPointer { rotBuf in
+                                callsignBuf.withUnsafeMutableBufferPointer { csBuf in
+                                    eoo_callsign_decode(rotBuf.baseAddress,
+                                                       Int32(attempt.symbolCount),
+                                                       csBuf.baseAddress,
+                                                       Int32(csBuf.count)) != 0
+                                }
+                            }
+                            if okRotated {
+                                decodedCallsign = String(cString: callsignBuf)
+                                return true
+                            }
+                        }
+                    }
+
+                    return false
                 }
+
                 if decoded {
-                    let callsign = String(cString: callsignBuf)
-                    onCallsignDecoded?(callsign)
+                    onCallsignDecoded?(decodedCallsign)
+                } else {
+                    appLog("EOO detected but callsign decode failed (symbols=\(totalSymCount))")
                 }
+                onEooDetected?(decodedCallsign)
             }
 
             // Handle decoded feature frames.
@@ -426,4 +503,3 @@ class RADEWrapper {
     }
 }
 #endif
-

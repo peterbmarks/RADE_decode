@@ -151,6 +151,9 @@ struct SettingsView: View {
             Section("About") {
                 LabeledContent("Version", value: Bundle.main.shortVersion)
                 LabeledContent("License", value: "LGPL-2.1-or-later")
+                Text("This app includes third-party components under their respective licenses.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
                 Link("FreeDV Project", destination: URL(string: "https://freedv.org")!)
                 Link("Privacy Policy", destination: URL(string: "https://freedv.org/privacy")!)
             }
@@ -179,6 +182,10 @@ struct SettingsView: View {
                     )
                 }
                 .padding(.vertical, 4)
+
+                Text("See repository notices for full third-party license details.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
             }
         }
         .navigationTitle("Settings")

@@ -527,6 +527,11 @@ int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx
     int Ncp = ofdm->ncp;
     int Ns = ofdm->ns;
 
+    /* Defensive bounds guard for static stack arrays below. */
+    if (Ns < 1 || Ns > RADE_NS || Nc > RADE_NC || M > RADE_M || Ncp > RADE_NCP) {
+        return 0;
+    }
+
     /* EOO frame structure: P E 0 0 0 E
        Demodulate all Ns+2 symbols */
     RADE_COMP rx_sym[(RADE_NS + 2)][RADE_NC];
@@ -543,7 +548,7 @@ int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx
         RADE_COMP sum = rade_czero();
         sum = rade_cadd(sum, rade_cdiv(rx_sym[0][c], ofdm->P[c]));
         sum = rade_cadd(sum, rade_cdiv(rx_sym[1][c], ofdm->Pend[c]));
-        sum = rade_cadd(sum, rade_cdiv(rx_sym[Ns][c], ofdm->Pend[c]));
+        sum = rade_cadd(sum, rade_cdiv(rx_sym[Ns + 1][c], ofdm->Pend[c]));
         float phase_offset = rade_cangle(sum);
 
         /* Correct all symbols */
@@ -552,9 +557,9 @@ int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx
         }
     }
 
-    /* Extract data symbols (symbols 2 to Ns, i.e., Ns-1 symbols) */
+    /* Extract data symbols (symbols 2 to Ns, i.e., Ns-1 data symbols) */
     int out_idx = 0;
-    for (int s = 2; s < Ns; s++) {
+    for (int s = 2; s <= Ns; s++) {
         for (int c = 0; c < Nc; c++) {
             z_hat[out_idx++] = rx_sym[s][c].real;
             z_hat[out_idx++] = rx_sym[s][c].imag;

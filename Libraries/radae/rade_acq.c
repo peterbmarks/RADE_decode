@@ -298,7 +298,11 @@ int rade_acq_check_pilots(rade_acq *acq, const RADE_COMP *rx,
     acq->Dtmax12_eoo = Dtmax12_eoo;
 
     *valid = (Dtmax12 > acq->Dthresh) ? 1 : 0;
-    *endofover = (Dtmax12_eoo > Dthresh_eoo) ? 1 : 0;
+    /* EOO correlation is weaker than normal pilots on mobile front-ends
+       (Android TX may apply additional gain scaling to EOO frame).
+       Use 40% of Dthresh_eoo: during normal data Dtmax12_eoo is ~0.01-0.03,
+       while 40% threshold is ~0.07, so false positives are still impossible. */
+    *endofover = (Dtmax12_eoo > (0.40f * Dthresh_eoo)) ? 1 : 0;
 
     return *valid;
 }
