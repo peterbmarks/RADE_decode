@@ -34,7 +34,7 @@ final class DeferredSampleStore {
         guard count > 0 else { return }
         guard let handle = ensureWriter() else { return }
         let data = Data(bytes: samples, count: count * MemoryLayout<Int16>.size)
-        handle.write(data)
+        try? handle.write(contentsOf: data)
     }
 
     /// Close the current writer and start a new batch file.

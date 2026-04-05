@@ -32,6 +32,7 @@ struct ReceptionMapView: View {
             }
         }
         .mapStyle(.standard(elevation: .realistic))
+        .ignoresSafeArea(edges: .bottom)
         .overlay(alignment: .bottom) {
             if sessionsWithLocation.isEmpty && callsignAnnotations.isEmpty {
                 VStack(spacing: 8) {
@@ -52,7 +53,7 @@ struct ReceptionMapView: View {
                 .padding()
             }
         }
-        .navigationTitle("Reception Map")
+
     }
     
     // MARK: - Data

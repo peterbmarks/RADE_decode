@@ -510,7 +510,7 @@ int rade_ofdm_demod_frame(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *
         return out_idx;
     } else {
         /* EOO frame - use simpler equalization */
-        return rade_ofdm_demod_eoo(ofdm, z_hat, rx_in, time_offset);
+        return rade_ofdm_demod_eoo(ofdm, z_hat, rx_in, time_offset, NULL);
     }
 }
 
@@ -521,7 +521,8 @@ const RADE_COMP* rade_ofdm_get_eoo(const rade_ofdm *ofdm, int *n_out) {
 }
 
 /* Demodulate EOO frame */
-int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in, int time_offset) {
+int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx_in,
+                         int time_offset, float *quality) {
     int Nc = ofdm->nc;
     int M = ofdm->m;
     int Ncp = ofdm->ncp;
@@ -529,10 +530,12 @@ int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx
 
     /* Defensive bounds guard for static stack arrays below. */
     if (Ns < 1 || Ns > RADE_NS || Nc > RADE_NC || M > RADE_M || Ncp > RADE_NCP) {
+        if (quality) *quality = 0.0f;
         return 0;
     }
 
-    /* EOO frame structure: P E 0 0 0 E
+    /* EOO frame structure: P E D D D E  (positions 0..Ns+1)
+       P at 0, Pend at 1, data at 2..Ns, Pend at Ns+1.
        Demodulate all Ns+2 symbols */
     RADE_COMP rx_sym[(RADE_NS + 2)][RADE_NC];
     RADE_COMP time_buf[RADE_M];
@@ -543,26 +546,55 @@ int rade_ofdm_demod_eoo(const rade_ofdm *ofdm, float *z_hat, const RADE_COMP *rx
         rade_ofdm_dft(ofdm, rx_sym[s], time_buf);
     }
 
-    /* Simpler EQ: average phase from P, E1, E2 pilots */
+    /* Per-carrier channel estimation from 3 pilots.
+       H0 from regular pilot P@0 (always present in every frame).
+       H1 from EOO pilot Pend@1 (only valid in EOO frame).
+       H5 from EOO pilot Pend@(Ns+1) (only valid in EOO frame).
+
+       Quality metric: normalized correlation of H1,H5 against H0.
+       For an actual EOO frame, H0≈H1≈H5≈H, so correlation ≈ 2·|H|².
+       For a normal voice frame:
+         - H1 = voice_data/Pend → random, uncorrelated with H0
+         - H5 = P·H/Pend = (-1)^c · H → alternating-sign sum cancels (Nc even)
+       So non-EOO gives q≈0, EOO gives q≈2. Threshold ~0.8 works robustly. */
+    float power_sum = 0.0f;
+    float corr_sum = 0.0f;
+    RADE_COMP H_early[RADE_NC];
+    RADE_COMP H_late[RADE_NC];
+
     for (int c = 0; c < Nc; c++) {
-        RADE_COMP sum = rade_czero();
-        sum = rade_cadd(sum, rade_cdiv(rx_sym[0][c], ofdm->P[c]));
-        sum = rade_cadd(sum, rade_cdiv(rx_sym[1][c], ofdm->Pend[c]));
-        sum = rade_cadd(sum, rade_cdiv(rx_sym[Ns + 1][c], ofdm->Pend[c]));
-        float phase_offset = rade_cangle(sum);
+        RADE_COMP H0 = rade_cdiv(rx_sym[0][c], ofdm->P[c]);
+        RADE_COMP H1 = rade_cdiv(rx_sym[1][c], ofdm->Pend[c]);
+        RADE_COMP H5 = rade_cdiv(rx_sym[Ns + 1][c], ofdm->Pend[c]);
 
-        /* Correct all symbols */
-        for (int s = 0; s < Ns + 2; s++) {
-            rx_sym[s][c] = rade_cmul(rx_sym[s][c], rade_cexp(-phase_offset));
-        }
+        /* Accumulate channel power from reliable pilot H0 */
+        power_sum += rade_cabs2(H0);
+
+        /* Correlation: Re(H1 · conj(H0)) + Re(H5 · conj(H0))
+           Positive when H1,H5 agree with H0 (true EOO pilots). */
+        corr_sum += H1.real * H0.real + H1.imag * H0.imag;
+        corr_sum += H5.real * H0.real + H5.imag * H0.imag;
+
+        /* Interpolated channel estimates for equalization */
+        H_early[c] = rade_cscale(rade_cadd(H0, H1), 0.5f);
+        H_late[c] = H5;
     }
+    float q = corr_sum / (power_sum + 1e-12f);
+    if (quality) *quality = q;
 
-    /* Extract data symbols (symbols 2 to Ns, i.e., Ns-1 data symbols) */
+    /* Interpolated phase correction for data symbols at positions 2..Ns.
+       Early estimate at effective position 0.5, late at position Ns+1.
+       t = (s - 0.5) / (Ns + 1 - 0.5) = (s - 0.5) / (Ns + 0.5) */
+    float t_denom = (float)Ns + 0.5f;
     int out_idx = 0;
     for (int s = 2; s <= Ns; s++) {
+        float t = ((float)s - 0.5f) / t_denom;
         for (int c = 0; c < Nc; c++) {
-            z_hat[out_idx++] = rx_sym[s][c].real;
-            z_hat[out_idx++] = rx_sym[s][c].imag;
+            RADE_COMP ch_est = rade_clerp(H_early[c], H_late[c], t);
+            float ch_angle = rade_cangle(ch_est);
+            RADE_COMP corrected = rade_cmul(rx_sym[s][c], rade_cexp(-ch_angle));
+            z_hat[out_idx++] = corrected.real;
+            z_hat[out_idx++] = corrected.imag;
         }
     }
 

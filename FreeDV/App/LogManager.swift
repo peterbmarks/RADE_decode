@@ -60,7 +60,7 @@ class LogManager: ObservableObject {
         // Write to persistent file (survives app kill)
         queue.async {
             if let data = (entry + "\n").data(using: .utf8) {
-                self.fileHandle?.write(data)
+                try? self.fileHandle?.write(contentsOf: data)
             }
         }
         

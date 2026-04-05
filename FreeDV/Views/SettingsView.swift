@@ -9,6 +9,10 @@ struct SettingsView: View {
     @Bindable var reporter: FreeDVReporter
     @StateObject private var deviceManager = AudioDeviceManager()
     @StateObject private var locationHelper = LocationHelper()
+    @AppStorage("fftEnabledPreference") private var fftEnabledPreference = true
+    @AppStorage("rxInputGainDb") private var rxInputGainDb = 0.0
+    @AppStorage("rxEqCompensationEnabled") private var rxEqCompensationEnabled = false
+    @AppStorage("rxEqCompensationGainDb") private var rxEqCompensationGainDb = 4.5
     
     var body: some View {
         Form {
@@ -115,6 +119,40 @@ struct SettingsView: View {
                     }
                 }
                 #endif
+                
+                Toggle("Show FFT / Waterfall", isOn: $fftEnabledPreference)
+                Text("Disable to reduce CPU load and avoid RX chunk drops. Recommended on older devices to improve decode performance.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                
+                VStack(alignment: .leading, spacing: 8) {
+                    HStack {
+                        Text("RX Input Gain")
+                        Spacer()
+                        Text(String(format: "%.1f dB", rxInputGainDb))
+                            .foregroundStyle(.secondary)
+                    }
+                    Slider(value: $rxInputGainDb, in: 0...18, step: 0.5)
+                    Text("Digital preamp before demod. Increase if weak devices decode poorly; too high can clip.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+                
+                Toggle("RX EQ Compensation", isOn: $rxEqCompensationEnabled)
+                if rxEqCompensationEnabled {
+                    VStack(alignment: .leading, spacing: 8) {
+                        HStack {
+                            Text("Mid Boost")
+                            Spacer()
+                            Text(String(format: "%.1f dB", rxEqCompensationGainDb))
+                                .foregroundStyle(.secondary)
+                        }
+                        Slider(value: $rxEqCompensationGainDb, in: 0...9, step: 0.5)
+                        Text("Peaking EQ centered near 1.6 kHz (Q≈1.15) to compensate iPhone mic mid-band dip.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                }
             }
             
             // GPS tracking & background location
@@ -323,7 +361,7 @@ struct RecordingSettingsSection: View {
     @AppStorage("autoRecordEnabled") private var autoRecordEnabled = true
     @AppStorage("maxStorageMB") private var maxStorageMB = 2000  // 2 GB default
     @Environment(\.modelContext) private var modelContext
-    @State private var usedSpace: String = "Calculating..."
+    @State private var usedSpace: String = NSLocalizedString("Calculating...", comment: "Storage size is being calculated")
     @State private var showClearConfirm = false
     
     var body: some View {

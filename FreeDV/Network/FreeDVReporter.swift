@@ -15,8 +15,10 @@ struct ReporterStation: Identifiable {
     var frequencyHz: UInt64?
     var mode: String?
     var transmitting: Bool = false
-    var lastRxCallsign: String?
+    var lastRxCallsign: String?         // decoded TX callsign (sticky, cleared by timeout)
     var lastRxSNR: Double?
+    var lastRxDate: Date?               // when any rx_report was last received (= receivingAt)
+    var receivedCallsignAt: Date?       // when lastRxCallsign was last set non-empty
     var lastUpdate: Date
     var message: String?
     
@@ -273,7 +275,10 @@ class FreeDVReporter {
             
         case "remove_connection":
             if let dict = eventData as? [String: Any], let sid = dict["sid"] as? String {
-                DispatchQueue.main.async { self.stations.removeValue(forKey: sid) }
+                DispatchQueue.main.async {
+                    self.stations.removeValue(forKey: sid)
+                    // RX links on other stations are NOT cleared — timeout handles it
+                }
             }
             
         case "bulk_update":
@@ -427,9 +432,21 @@ class FreeDVReporter {
             version: (dict["version"] as? String) ?? "",
             rxOnly: (dict["rx_only"] as? Bool) ?? false,
             frequencyHz: (dict["freq"] as? NSNumber)?.uint64Value,
-            lastUpdate: Date()
+            transmitting: (dict["transmitting"] as? Bool) ?? false,
+            lastUpdate: Date(),
+            message: dict["message"] as? String
         )
-        DispatchQueue.main.async { self.stations[sid] = station }
+        DispatchQueue.main.async {
+            // Preserve RX data if station was already created from an earlier rx_report
+            let existing = self.stations[sid]
+            self.stations[sid] = station
+            if existing?.lastRxDate != nil {
+                self.stations[sid]?.lastRxCallsign = existing?.lastRxCallsign
+                self.stations[sid]?.lastRxSNR = existing?.lastRxSNR
+                self.stations[sid]?.lastRxDate = existing?.lastRxDate
+                self.stations[sid]?.receivedCallsignAt = existing?.receivedCallsignAt
+            }
+        }
     }
     
     private func handleBulkUpdate(_ updates: [[Any]]) {
@@ -445,6 +462,8 @@ class FreeDVReporter {
                 handleFreqChange(eventData)
             case "tx_report":
                 handleTxReport(eventData)
+            case "rx_report":
+                handleRxReport(eventData)
             default:
                 break
             }
@@ -453,10 +472,48 @@ class FreeDVReporter {
     
     private func handleRxReport(_ dict: [String: Any]) {
         guard let sid = dict["sid"] as? String else { return }
+        let raw = (dict["callsign"] as? String)?.uppercased()
+        let hasCallsign = raw != nil && !raw!.isEmpty
+
+        // Use server's last_update timestamp if available (bulk_update),
+        // otherwise current time (real-time event).
+        let eventTime: Date
+        if let ts = dict["last_update"] as? Double {
+            eventTime = Date(timeIntervalSince1970: ts)
+        } else if let ts = dict["last_update"] as? Int {
+            eventTime = Date(timeIntervalSince1970: Double(ts))
+        } else {
+            eventTime = Date()
+        }
+
         DispatchQueue.main.async {
-            self.stations[sid]?.lastRxCallsign = dict["callsign"] as? String
-            self.stations[sid]?.lastRxSNR = dict["snr"] as? Double
-            self.stations[sid]?.lastUpdate = Date()
+            if self.stations[sid] != nil {
+                // Always mark as receiving and update SNR
+                self.stations[sid]?.lastRxDate = eventTime
+                self.stations[sid]?.lastUpdate = eventTime
+                if let snr = (dict["snr"] as? NSNumber)?.doubleValue {
+                    self.stations[sid]?.lastRxSNR = snr
+                }
+                // Only update callsign if non-empty (sticky)
+                if hasCallsign {
+                    self.stations[sid]?.lastRxCallsign = raw
+                    self.stations[sid]?.receivedCallsignAt = eventTime
+                }
+            } else if let receiverCallsign = dict["receiver_callsign"] as? String {
+                // Station not yet created (rx_report arrived before new_connection in bulk_update)
+                self.stations[sid] = ReporterStation(
+                    sid: sid,
+                    callsign: receiverCallsign.uppercased(),
+                    gridSquare: (dict["receiver_grid_square"] as? String) ?? "",
+                    version: "",
+                    rxOnly: false,
+                    lastRxCallsign: hasCallsign ? raw : nil,
+                    lastRxSNR: (dict["snr"] as? NSNumber)?.doubleValue,
+                    lastRxDate: eventTime,
+                    receivedCallsignAt: hasCallsign ? eventTime : nil,
+                    lastUpdate: eventTime
+                )
+            }
         }
     }
     
@@ -470,10 +527,12 @@ class FreeDVReporter {
     
     private func handleTxReport(_ dict: [String: Any]) {
         guard let sid = dict["sid"] as? String else { return }
+        let isTransmitting = (dict["transmitting"] as? Bool) ?? false
         DispatchQueue.main.async {
-            self.stations[sid]?.transmitting = (dict["transmitting"] as? Bool) ?? false
+            self.stations[sid]?.transmitting = isTransmitting
             self.stations[sid]?.mode = dict["mode"] as? String
             self.stations[sid]?.lastUpdate = Date()
+            // RX state on other stations is NOT cleared here — timeout handles it
         }
     }
 }

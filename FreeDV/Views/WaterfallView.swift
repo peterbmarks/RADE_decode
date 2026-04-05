@@ -34,6 +34,17 @@ struct WaterfallView: View {
                         context.fill(Path(rect), with: .color(color))
                     }
                 }
+                
+                // Frequency reference lines to help tuning alignment
+                let guideFreqs: [CGFloat] = [750, 1500, 2200]
+                let maxFreq: CGFloat = 4000
+                for freq in guideFreqs {
+                    let x = freq / maxFreq * size.width
+                    var path = Path()
+                    path.move(to: CGPoint(x: x, y: 0))
+                    path.addLine(to: CGPoint(x: x, y: size.height))
+                    context.stroke(path, with: .color(.white.opacity(0.40)), lineWidth: 1.0)
+                }
             }
         }
     }

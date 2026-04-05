@@ -246,9 +246,10 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
         /* Update SNR estimate with moving average */
         rx->snrdB_3k_est = 0.9f * rx->snrdB_3k_est + 0.1f * snr_est;
 
-        valid_output = !endofover;
-
-        if (valid_output) {
+        /* Always decode features (even during EOO — one frame of garbage at
+           end of over is acceptable and avoids audio gaps on false positives) */
+        valid_output = 1;
+        {
             /* Decode latents to features */
             int Nzmf = RADE_NZMF;
             int latent_dim = RADE_LATENT_DIM;
@@ -292,13 +293,26 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
             }
         }
 
-        if (endofover) {
-            /* Copy EOO symbols to output */
+        /* Always attempt EOO demod in SYNC state.  Detect EOO via pilot
+           coherence quality from the demod itself, which is far more reliable
+           than the time-domain cross-correlation in rade_acq_check_pilots.
+           The callsign codec CRC protects against false positive decodes. */
+        {
             float z_hat_eoo[(RADE_NS - 1) * RADE_NC * 2];
-            rade_ofdm_demod_eoo(&rx->ofdm, z_hat_eoo, rx_corrected, rx->time_offset);
+            float eoo_quality = 0.0f;
+            rade_ofdm_demod_eoo(&rx->ofdm, z_hat_eoo, rx_corrected,
+                                rx->time_offset, &eoo_quality);
 
-            int n_eoo_bits = rade_rx_n_eoo_bits(rx);
-            memcpy(eoo_out, z_hat_eoo, sizeof(float) * n_eoo_bits);
+            /* Normalized correlation metric: EOO ≈ 2.0, non-EOO ≈ 0.0.
+               Slightly lower threshold improves weak-signal sensitivity.
+               CRC in callsign decode still protects from false positives. */
+            float eoo_thresh = 0.65f;
+            if (eoo_quality > eoo_thresh) {
+                fprintf(stderr, "EOO_Q: quality=%.3f thresh=%.3f\n", eoo_quality, eoo_thresh);
+                int n_eoo_bits = rade_rx_n_eoo_bits(rx);
+                memcpy(eoo_out, z_hat_eoo, sizeof(float) * n_eoo_bits);
+                endofover = 1;
+            }
         }
     }
 
@@ -371,7 +385,11 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
             }
         }
 
-        if (unsync_enable && (endofover || uw_fail)) {
+        /* EOO detection no longer forces immediate SEARCH — callsign CRC
+           provides reliable confirmation, and valid_count will naturally
+           expire within a few seconds after the transmission ends.
+           Only uw_fail (unique word errors) still forces immediate unsync. */
+        if (unsync_enable && uw_fail) {
             next_state = RADE_STATE_SEARCH;
         }
     }

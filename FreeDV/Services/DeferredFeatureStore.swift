@@ -45,7 +45,7 @@ final class DeferredFeatureStore {
             }
         }
 
-        handle.write(data)
+        try? handle.write(contentsOf: data)
     }
 
     /// Fast path for background decode: append contiguous Float features directly.
@@ -54,7 +54,7 @@ final class DeferredFeatureStore {
         guard count > 0 else { return }
         guard let handle = ensureWriter() else { return }
         let data = Data(bytes: values, count: count * MemoryLayout<Float>.size)
-        handle.write(data)
+        try? handle.write(contentsOf: data)
     }
 
     func drain(frameWidth: Int, batchFrames: Int, process: ([[Float]]) -> Void) {

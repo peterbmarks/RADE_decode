@@ -132,10 +132,10 @@ class RADEWrapper {
         // Initialize the RADE library
         rade_initialize()
 
-        // Open RADE context with C encoder and decoder.
-        // Keep verbose logs enabled so EOO detection metrics (endofover, Dtmax12_eoo)
-        // are visible in Xcode console during troubleshooting.
-        let flags: Int32 = RADE_USE_C_ENCODER | RADE_USE_C_DECODER
+        // Open RADE context with C encoder and decoder, quiet mode.
+        // RADE_VERBOSE_0 suppresses per-frame fprintf to stderr which causes
+        // significant I/O overhead on iOS and degrades real-time decoding.
+        let flags: Int32 = RADE_USE_C_ENCODER | RADE_USE_C_DECODER | RADE_VERBOSE_0
         var modelPath = Array("built-in".utf8CString)
         radePtr = modelPath.withUnsafeMutableBufferPointer { buf -> OpaquePointer? in
             return rade_open(buf.baseAddress, flags)
@@ -244,73 +244,32 @@ class RADEWrapper {
                 let decoded = eooOut.withUnsafeBufferPointer { eooBuf -> Bool in
                     guard let base = eooBuf.baseAddress else { return false }
 
-                    var attempts: [(offsetSymbols: Int, symbolCount: Int)] = []
-                    attempts.append((offsetSymbols: 0, symbolCount: totalSymCount))
-                    attempts.append((offsetSymbols: 0, symbolCount: min(totalSymCount, 56)))
-
-                    if totalSymCount >= 56 {
-                        let maxOffset = min(8, totalSymCount - 56)
-                        if maxOffset > 0 {
-                            for offset in 1...maxOffset {
-                                attempts.append((offsetSymbols: offset, symbolCount: 56))
-                            }
-                        }
-                    }
+                    // The OFDM demod already equalizes phase per carrier with
+                    // interpolation, so the symbols should be correctly oriented.
+                    // Try with the full symbol count (90) first, then just the
+                    // LDPC portion (56).  QPSK rotation attempts are not useful
+                    // because they permute the bit-to-symbol mapping and the
+                    // LDPC decoder cannot recover from that.
+                    let attempts: [(offset: Int, count: Int)] = [
+                        (0, totalSymCount),
+                        (0, min(totalSymCount, 56))
+                    ]
 
                     for attempt in attempts {
-                        let floatOffset = attempt.offsetSymbols * 2
-                        let floatCount = attempt.symbolCount * 2
+                        let floatOffset = attempt.offset * 2
+                        let floatCount = attempt.count * 2
                         guard floatOffset + floatCount <= eooBuf.count else { continue }
 
                         var callsignBuf = [CChar](repeating: 0, count: 16)
-                        let okDirect = callsignBuf.withUnsafeMutableBufferPointer { csBuf in
+                        let ok = callsignBuf.withUnsafeMutableBufferPointer { csBuf in
                             eoo_callsign_decode(base.advanced(by: floatOffset),
-                                               Int32(attempt.symbolCount),
+                                               Int32(attempt.count),
                                                csBuf.baseAddress,
                                                Int32(csBuf.count)) != 0
                         }
-
-                        if okDirect {
+                        if ok {
                             decodedCallsign = String(cString: callsignBuf)
                             return true
-                        }
-
-                        // Try constellation phase ambiguity rotations: 90/180/270 deg.
-                        var rotated = [Float](repeating: 0, count: floatCount)
-                        for rotation in 1...3 {
-                            for idx in stride(from: 0, to: floatCount, by: 2) {
-                                let re = base[floatOffset + idx]
-                                let im = base[floatOffset + idx + 1]
-                                let rr: Float
-                                let ii: Float
-                                switch rotation {
-                                case 1: // +90 deg
-                                    rr = -im
-                                    ii = re
-                                case 2: // 180 deg
-                                    rr = -re
-                                    ii = -im
-                                default: // +270 deg
-                                    rr = im
-                                    ii = -re
-                                }
-                                rotated[idx] = rr
-                                rotated[idx + 1] = ii
-                            }
-
-                            callsignBuf = [CChar](repeating: 0, count: 16)
-                            let okRotated = rotated.withUnsafeBufferPointer { rotBuf in
-                                callsignBuf.withUnsafeMutableBufferPointer { csBuf in
-                                    eoo_callsign_decode(rotBuf.baseAddress,
-                                                       Int32(attempt.symbolCount),
-                                                       csBuf.baseAddress,
-                                                       Int32(csBuf.count)) != 0
-                                }
-                            }
-                            if okRotated {
-                                decodedCallsign = String(cString: callsignBuf)
-                                return true
-                            }
                         }
                     }
 

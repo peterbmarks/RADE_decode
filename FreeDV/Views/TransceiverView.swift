@@ -43,18 +43,45 @@ struct TransceiverView: View {
                         .padding(.top, 4)
 
                         // Spectrum + Waterfall stacked display
-                        VStack(spacing: 1) {
-                            SpectrumView(fftData: viewModel.fftData)
-                                .frame(height: geo.size.height * 0.18)
+                        Group {
+                            if viewModel.effectiveFFTEnabled {
+                                VStack(spacing: 1) {
+                                    SpectrumView(fftData: viewModel.fftData)
+                                        .frame(height: geo.size.height * 0.18)
 
-                            WaterfallView(history: viewModel.waterfallHistory)
-                                .frame(height: geo.size.height * 0.22)
+                                    WaterfallView(history: viewModel.waterfallHistory)
+                                        .frame(height: geo.size.height * 0.22)
+                                }
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
+                                )
+                            } else {
+                                VStack(spacing: 8) {
+                                    Image(systemName: "gauge.with.dots.needle.33percent")
+                                        .font(.system(size: 18))
+                                        .foregroundStyle(.orange.opacity(0.9))
+                                    if viewModel.autoLowLoadModeActive {
+                                        Text("Auto low-load mode enabled")
+                                            .font(.system(size: 12, weight: .semibold))
+                                            .foregroundStyle(.orange.opacity(0.95))
+                                    }
+                                    Text("On older devices, turning off FFT / Waterfall can improve sync and decode speed.")
+                                        .font(.system(size: 11))
+                                        .foregroundStyle(.secondary)
+                                        .multilineTextAlignment(.center)
+                                }
+                                .frame(maxWidth: .infinity)
+                                .frame(height: geo.size.height * 0.40)
+                                .background(Color.white.opacity(0.03))
+                                .clipShape(RoundedRectangle(cornerRadius: 8))
+                                .overlay(
+                                    RoundedRectangle(cornerRadius: 8)
+                                        .stroke(Color.orange.opacity(0.25), lineWidth: 0.8)
+                                )
+                            }
                         }
-                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                        .overlay(
-                            RoundedRectangle(cornerRadius: 8)
-                                .stroke(Color.white.opacity(0.1), lineWidth: 0.5)
-                        )
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                         
@@ -453,7 +480,7 @@ private struct ActiveTaskCard: View {
                 }
 
                 if task.signalCount > 0 {
-                    Label("\(task.signalCount) signal\(task.signalCount == 1 ? "" : "s") found", systemImage: "antenna.radiowaves.left.and.right")
+                    Label(signalsFoundText(task.signalCount), systemImage: "antenna.radiowaves.left.and.right")
                         .font(.caption)
                         .foregroundStyle(.green)
                 }
@@ -592,6 +619,13 @@ private struct CompactTaskCard: View {
 
 // MARK: - Helpers
 
+private func signalsFoundText(_ count: Int) -> String {
+    String.localizedStringWithFormat(
+        NSLocalizedString("%d signals found", comment: "Background analysis signal count"),
+        count
+    )
+}
+
 private func relativeTimestamp(_ date: Date) -> String {
     let calendar = Calendar.current
     let timeFormatter = DateFormatter()
@@ -599,9 +633,15 @@ private func relativeTimestamp(_ date: Date) -> String {
     let timeString = timeFormatter.string(from: date)
 
     if calendar.isDateInToday(date) {
-        return "Today \(timeString)"
+        return String.localizedStringWithFormat(
+            NSLocalizedString("Today %@", comment: "Timestamp prefix for today"),
+            timeString
+        )
     } else if calendar.isDateInYesterday(date) {
-        return "Yesterday \(timeString)"
+        return String.localizedStringWithFormat(
+            NSLocalizedString("Yesterday %@", comment: "Timestamp prefix for yesterday"),
+            timeString
+        )
     } else {
         let dayFormatter = DateFormatter()
         dayFormatter.dateFormat = "MMM d"
@@ -619,10 +659,14 @@ private func formatDuration(_ seconds: Double) -> String {
 
 private func formatETA(_ seconds: Double) -> String {
     let s = max(0, Int(seconds.rounded()))
-    if s == 0 { return "almost done" }
+    if s == 0 { return NSLocalizedString("almost done", comment: "ETA indicates completion is imminent") }
     let m = s / 60
     let r = s % 60
-    return String(format: "~%d:%02d left", m, r)
+    return String.localizedStringWithFormat(
+        NSLocalizedString("~%d:%02d left", comment: "ETA with minutes and seconds remaining"),
+        m,
+        r
+    )
 }
 
 #Preview {

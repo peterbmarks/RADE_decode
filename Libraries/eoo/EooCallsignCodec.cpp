@@ -654,44 +654,84 @@ bool EooCallsignDecoder::decode(const float *syms, int symSize,
     rms = std::sqrt(rms / static_cast<float>(symSize));
 
     // Guard against zero-amplitude input (no signal → can't decode)
-    if (rms < 1e-10f) return false;
+    if (rms < 1e-10f) {
+        fprintf(stderr, "EOO_DIAG: rms=0 (no signal), symSize=%d\n", symSize);
+        return false;
+    }
+
+    // Diagnostic: print first few input symbols and RMS
+    fprintf(stderr, "EOO_DIAG: symSize=%d rms=%.4f", symSize, rms);
+    fprintf(stderr, " in[0]=(%.3f,%.3f) in[1]=(%.3f,%.3f) in[2]=(%.3f,%.3f)\n",
+            syms[0], syms[1], syms[2], syms[3], syms[4], syms[5]);
 
     // --- Step 3: soft-decision LDPC decode --------------------------------
     float amps[56];
     for (int i = 0; i < 56; i++) amps[i] = rms;
 
     float   llr[112];
-    uint8_t decoded[112] = {};
-    int     parityChecks = 0;
+    const float esnoCandidates[] = {0.8f, 1.2f, 1.8f, 3.0f, 4.5f};
+    const int numCandidates = static_cast<int>(sizeof(esnoCandidates) / sizeof(esnoCandidates[0]));
 
-    eoo_symbols_to_llrs(llr, pending, amps, /*EsNo=*/3.0f, rms, 56);
-    int ldpcIter = eoo_run_ldpc_decoder(decoded, llr, &parityChecks);
+    int bestParityChecks = -1;
+    float bestBer = 1.0f;
+    float bestEsNo = esnoCandidates[0];
+    int bestLdpcIter = 0;
 
-    // --- Step 4: BER gate (threshold 0.2, matching rade_text_rx) ----------
-    const float ber = static_cast<float>(kNumParityBits - parityChecks)
-                    / static_cast<float>(kNumParityBits);
-    if (ber >= 0.2f) return false;
+    for (int k = 0; k < numCandidates; k++) {
+        const float esno = esnoCandidates[k];
+        uint8_t decoded[112] = {};
+        int parityChecks = 0;
 
-    // --- Step 5: unpack 56 info bits into 9 raw bytes ---------------------
-    //   rawStr[0]    = CRC-8  (bits 0–7, standard 8-bit packing)
-    //   rawStr[1..8] = OTA-encoded callsign chars (bits 8–55, 6 bits each)
-    char rawStr[9] = {};
-    for (int b = 0; b < 8; b++)
-        if (decoded[b]) rawStr[0] |= static_cast<char>(1 << b);
-    for (int b = 8; b < 56; b++) {
-        const int off = b - 8;
-        if (decoded[b])
-            rawStr[1 + off / 6] |= static_cast<char>(1 << (off % 6));
+        eoo_symbols_to_llrs(llr, pending, amps, esno, rms, 56);
+        int ldpcIter = eoo_run_ldpc_decoder(decoded, llr, &parityChecks);
+
+        const float ber = static_cast<float>(kNumParityBits - parityChecks)
+                        / static_cast<float>(kNumParityBits);
+        fprintf(stderr, "EOO_DIAG: EsNo=%.2f ldpcIter=%d parityChecks=%d/%d BER=%.3f\n",
+                esno, ldpcIter, parityChecks, kNumParityBits, ber);
+
+        if (parityChecks > bestParityChecks) {
+            bestParityChecks = parityChecks;
+            bestBer = ber;
+            bestEsNo = esno;
+            bestLdpcIter = ldpcIter;
+        }
+
+        // BER gate (threshold 0.2, matching rade_text_rx)
+        if (ber >= 0.2f) {
+            continue;
+        }
+
+        // --- Step 5: unpack 56 info bits into 9 raw bytes -----------------
+        //   rawStr[0]    = CRC-8  (bits 0–7, standard 8-bit packing)
+        //   rawStr[1..8] = OTA-encoded callsign chars (bits 8–55, 6 bits each)
+        char rawStr[9] = {};
+        for (int b = 0; b < 8; b++)
+            if (decoded[b]) rawStr[0] |= static_cast<char>(1 << b);
+        for (int b = 8; b < 56; b++) {
+            const int off = b - 8;
+            if (decoded[b])
+                rawStr[1 + off / 6] |= static_cast<char>(1 << (off % 6));
+        }
+
+        // --- Step 6: CRC-8 check (over OTA bytes, not ASCII) --------------
+        const uint8_t rxCrc   = static_cast<uint8_t>(rawStr[0]);
+        const uint8_t calcCrc = eoo_crc8(rawStr + 1, 8);
+        fprintf(stderr, "EOO_DIAG: EsNo=%.2f CRC rx=0x%02X calc=0x%02X %s\n",
+                esno, rxCrc, calcCrc, (rxCrc == calcCrc) ? "PASS" : "FAIL");
+        if (rxCrc != calcCrc) {
+            continue;
+        }
+
+        // --- Step 7: decode OTA values to ASCII callsign ------------------
+        callsign = eoo_ota_to_ascii(rawStr + 1, 8);
+        fprintf(stderr, "EOO_DIAG: decoded callsign='%s' EsNo=%.2f\n", callsign.c_str(), esno);
+        return true;
     }
 
-    // --- Step 6: CRC-8 check (over OTA bytes, not ASCII) ------------------
-    const uint8_t rxCrc   = static_cast<uint8_t>(rawStr[0]);
-    const uint8_t calcCrc = eoo_crc8(rawStr + 1, 8);
-    if (rxCrc != calcCrc) return false;
-
-    // --- Step 7: decode OTA values to ASCII callsign ----------------------
-    callsign = eoo_ota_to_ascii(rawStr + 1, 8);
-    return true;
+    fprintf(stderr, "EOO_DIAG: no CRC-pass candidate (best EsNo=%.2f ldpcIter=%d parityChecks=%d/%d BER=%.3f)\n",
+            bestEsNo, bestLdpcIter, bestParityChecks, kNumParityBits, bestBer);
+    return false;
 }
 
 void EooCallsignDecoder::encode(const std::string &callsign, float *syms,

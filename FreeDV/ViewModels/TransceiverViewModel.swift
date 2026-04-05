@@ -47,14 +47,16 @@ class TransceiverViewModel: ObservableObject {
     @Published var freqOffset: Float = 0
     @Published var inputLevel: Float = -60
     @Published var outputLevel: Float = -60
+    @Published var effectiveFFTEnabled = true
+    @Published var autoLowLoadModeActive = false
     
     // FFT data for spectrum display
     @Published var fftData: [Float] = Array(repeating: -100, count: 512)
     @Published var waterfallHistory: [[Float]] = []
     
     // Device info
-    @Published var currentInputDevice: String = "Unknown"
-    @Published var currentOutputDevice: String = "Unknown"
+    @Published var currentInputDevice: String = NSLocalizedString("Unknown", comment: "Unknown audio input device")
+    @Published var currentOutputDevice: String = NSLocalizedString("Unknown", comment: "Unknown audio output device")
     
     // Callsign (auto-clears after 10 seconds)
     @Published var decodedCallsign: String = ""
@@ -130,13 +132,21 @@ class TransceiverViewModel: ObservableObject {
 
                 // Skip FFT/waterfall updates in background (saves CPU + memory)
                 if !self.isInBackground {
-                    let newFFT = self.audioManager.fftData
-                    if newFFT != self.fftData {
-                        self.fftData = newFFT
-                        self.waterfallHistory.append(newFFT)
-                        let excess = self.waterfallHistory.count - self.maxWaterfallRows
-                        if excess > 0 {
-                            self.waterfallHistory.removeFirst(excess)
+                    self.autoLowLoadModeActive = self.audioManager.autoLowLoadModeActive
+                    let shouldEnableFFT = AudioManager.fftEnabledPreference
+                        && !self.audioManager.isFFTForcedOffForPerformance
+                        && !self.audioManager.isAcquisitionBoostActive
+                    self.effectiveFFTEnabled = shouldEnableFFT
+                    self.audioManager.fftEnabled = shouldEnableFFT
+                    if shouldEnableFFT {
+                        let newFFT = self.audioManager.fftData
+                        if newFFT != self.fftData {
+                            self.fftData = newFFT
+                            self.waterfallHistory.append(newFFT)
+                            let excess = self.waterfallHistory.count - self.maxWaterfallRows
+                            if excess > 0 {
+                                self.waterfallHistory.removeFirst(excess)
+                            }
                         }
                     }
                     
@@ -272,7 +282,7 @@ class TransceiverViewModel: ObservableObject {
         let task = BackgroundAnalysisTask(
             id: UUID(),
             createdAt: Date(),
-            title: "Capture #\(index)",
+            title: captureTitle(index: index),
             status: .pending,
             progress: 0,
             scannedSeconds: 0,
@@ -320,7 +330,7 @@ class TransceiverViewModel: ObservableObject {
                 var task = BackgroundAnalysisTask(
                     id: UUID(),
                     createdAt: Date(),
-                    title: "Capture #\(backgroundAnalysisTasks.count + 1)",
+                    title: captureTitle(index: backgroundAnalysisTasks.count + 1),
                     status: deferredDecodePaused ? .paused : .running,
                     progress: deferredDecodeProgress,
                     scannedSeconds: deferredDecodeScannedSeconds,
@@ -490,8 +500,10 @@ class TransceiverViewModel: ObservableObject {
         
         // Check if audio engine is still running after returning from background
         audioManager.checkEngineHealth()
-        // Restore FFT and UI timer in foreground.
-        audioManager.fftEnabled = true
+        // Restore FFT preference and UI timer in foreground.
+        audioManager.fftEnabled = AudioManager.fftEnabledPreference
+            && !audioManager.isFFTForcedOffForPerformance
+            && !audioManager.isAcquisitionBoostActive
         // Restart the UI timer
         restartStatusTimer(interval: 0.15)
         bgLog("ViewModel: exited background mode (settings restored)")
@@ -502,13 +514,13 @@ class TransceiverViewModel: ObservableObject {
     var syncStateText: String {
         switch syncState {
         case .searching:
-            return "Searching"
+            return NSLocalizedString("Searching", comment: "Sync state: searching")
         case .candidate:
-            return "Candidate"
+            return NSLocalizedString("Candidate", comment: "Sync state: candidate")
         case .synced:
-            return "Synced"
+            return NSLocalizedString("Synced", comment: "Sync state: synced")
         @unknown default:
-            return "Unknown"
+            return NSLocalizedString("Unknown", comment: "Sync state: unknown")
         }
     }
     
@@ -524,4 +536,11 @@ class TransceiverViewModel: ObservableObject {
             return .gray
         }
     }
+}
+
+private func captureTitle(index: Int) -> String {
+    String.localizedStringWithFormat(
+        NSLocalizedString("Capture #%d", comment: "Background analysis capture title"),
+        index
+    )
 }

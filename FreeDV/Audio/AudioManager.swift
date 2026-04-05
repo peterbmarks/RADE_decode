@@ -39,6 +39,17 @@ class AudioManager: ObservableObject {
     // Converter for sample rate conversion (mono float → 8kHz int16)
     private var rxConverter: AVAudioConverter?
     
+    // RX EQ compensation (iOS microphone mid-band dip compensation)
+    private var rxEqSampleRate: Float = 0
+    private var rxEqGainDbApplied: Float = 0
+    private var rxEqB0: Float = 1
+    private var rxEqB1: Float = 0
+    private var rxEqB2: Float = 0
+    private var rxEqA1: Float = 0
+    private var rxEqA2: Float = 0
+    private var rxEqZ1: Float = 0
+    private var rxEqZ2: Float = 0
+    
     // Published state
     @Published var isRunning = false
     @Published var syncState: RADESyncState = .searching
@@ -53,6 +64,7 @@ class AudioManager: ObservableObject {
     @Published var deferredDecodeScannedSeconds: Double = 0
     @Published var deferredDecodeETASeconds: Double = 0
     @Published var deferredDecodeSignalCount: Int = 0
+    @Published var autoLowLoadModeActive = false
     
     // FFT spectrum data (dB magnitude, 512 bins covering 0-4kHz at 8kHz sample rate)
     @Published var fftData: [Float] = Array(repeating: -100, count: 512)
@@ -99,6 +111,36 @@ class AudioManager: ObservableObject {
     static var gpsTrackingEnabled: Bool {
         get { UserDefaults.standard.object(forKey: "gpsTrackingEnabled") as? Bool ?? false }
         set { UserDefaults.standard.set(newValue, forKey: "gpsTrackingEnabled") }
+    }
+    
+    /// RX EQ compensation toggle.
+    static var rxEqCompensationEnabled: Bool {
+        get { UserDefaults.standard.object(forKey: "rxEqCompensationEnabled") as? Bool ?? false }
+        set { UserDefaults.standard.set(newValue, forKey: "rxEqCompensationEnabled") }
+    }
+    
+    /// RX EQ compensation peaking gain in dB.
+    static var rxEqCompensationGainDb: Float {
+        get {
+            let value = UserDefaults.standard.object(forKey: "rxEqCompensationGainDb") as? Double ?? 4.5
+            return Float(value)
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: "rxEqCompensationGainDb") }
+    }
+    
+    /// Foreground FFT processing toggle.
+    static var fftEnabledPreference: Bool {
+        get { UserDefaults.standard.object(forKey: "fftEnabledPreference") as? Bool ?? true }
+        set { UserDefaults.standard.set(newValue, forKey: "fftEnabledPreference") }
+    }
+    
+    /// Digital preamp gain for RX input (applied before EQ/RADE).
+    static var rxInputGainDb: Float {
+        get {
+            let value = UserDefaults.standard.object(forKey: "rxInputGainDb") as? Double ?? 0.0
+            return Float(value)
+        }
+        set { UserDefaults.standard.set(Double(newValue), forKey: "rxInputGainDb") }
     }
     
     // Reception logging
@@ -150,12 +192,22 @@ class AudioManager: ObservableObject {
     private let maxPendingProcessingChunks = 6
     private let maxPendingProcessingChunksInBackground = 2
     private var droppedProcessingChunks = 0
+    /// Auto low-load mode trigger for older/slower devices.
+    /// When too many RX chunks are dropped, disable FFT/waterfall processing.
+    private let autoLowLoadDropThreshold = 30
+    private var forceFFTOffForPerformance = false
     /// Last observed modem sync status, used by background throttle policy.
     private var isModemSyncedForBackground = false
     /// Event-driven background boost window for sync acquisition.
     private var backgroundDecodeBoostUntil: Date?
     private let backgroundDecodeBoostDuration: TimeInterval = 12
     private var backgroundChunkCounter = 0
+    /// Foreground acquisition boost window right after RX start.
+    /// During this window we disable FFT and add temporary preamp when unsynced.
+    private var acquisitionBoostUntil: Date?
+    private let acquisitionBoostDuration: TimeInterval = 20
+    private let acquisitionBoostGainDb: Float = 0.0
+    private var lastKnownSyncState: Int = 0
     
     /// Flag to signal processingQueue to skip work during shutdown
     private var shouldProcess = false
@@ -195,6 +247,13 @@ class AudioManager: ObservableObject {
     /// Background health check timer — runs on a background queue,
     /// periodically checks if the audio engine is still alive and restarts if needed.
     private var healthCheckTimer: DispatchSourceTimer?
+    /// RX watchdog timestamps for stale-pipeline recovery.
+    private var lastRxInputCallbackDate: Date?
+    private var lastModemFrameProcessedDate: Date?
+    private var lastRxRecoveryDate: Date?
+    private let rxInputStallThreshold: TimeInterval = 12
+    private let rxFrameStallThreshold: TimeInterval = 15
+    private let rxRecoveryCooldown: TimeInterval = 20
     
     init() {
         // Set up vDSP FFT
@@ -225,6 +284,20 @@ class AudioManager: ObservableObject {
 
     func setBackgroundRawSampleCaptureEnabled(_ enabled: Bool) {
         backgroundRawSampleCaptureEnabled = enabled
+    }
+
+    var isFFTForcedOffForPerformance: Bool {
+        processingBackpressureLock.lock()
+        let forced = forceFFTOffForPerformance
+        processingBackpressureLock.unlock()
+        return forced
+    }
+
+    var isAcquisitionBoostActive: Bool {
+        processingBackpressureLock.lock()
+        let active = acquisitionBoostUntil.map { Date() < $0 } ?? false
+        processingBackpressureLock.unlock()
+        return active
     }
 
     func setDeferredFeatureStorageEnabled(_ enabled: Bool) {
@@ -575,14 +648,19 @@ class AudioManager: ObservableObject {
     func setBackgroundAudioMode(_ background: Bool) {
         let session = AVAudioSession.sharedInstance()
         let newMode: AVAudioSession.Mode = background ? .default : .measurement
+        let newCategory: AVAudioSession.Category = background ? .playAndRecord : preferredSessionCategoryForCurrentState()
+        let newOptions: AVAudioSession.CategoryOptions = background
+            ? [.allowBluetooth, .defaultToSpeaker]
+            : preferredSessionOptionsForCurrentState()
         let currentMode = session.mode
+        let currentCategory = session.category
         
-        guard newMode != currentMode else {
-            bgLog("Audio mode already \(newMode.rawValue), skipping")
+        guard newMode != currentMode || newCategory != currentCategory else {
+            bgLog("Audio session already category=\(newCategory.rawValue) mode=\(newMode.rawValue), skipping")
             return
         }
         
-        bgLog("Switching audio mode from \(currentMode.rawValue) to \(newMode.rawValue)")
+        bgLog("Switching audio session from category=\(currentCategory.rawValue) mode=\(currentMode.rawValue) to category=\(newCategory.rawValue) mode=\(newMode.rawValue)")
         
         // Step 1: Stop the engine and remove input tap
         let wasRunning = audioEngine.isRunning
@@ -602,16 +680,16 @@ class AudioManager: ObservableObject {
         // Step 3: Set new category/mode
         do {
             try session.setCategory(
-                .playAndRecord,
+                newCategory,
                 mode: newMode,
-                options: [.allowBluetooth, .defaultToSpeaker]
+                options: newOptions
             )
             // Re-apply preferred audio parameters after category/mode switch.
             // iOS may inflate IO buffer duration in background, which can make
             // callback cadence too sparse for modem decoding.
             try session.setPreferredIOBufferDuration(0.04)
             try session.setPreferredSampleRate(48000)
-            bgLog("Category set with mode \(newMode.rawValue), ioBuffer=\(session.ioBufferDuration), preferredSR=\(session.preferredSampleRate)")
+            bgLog("Category set \(newCategory.rawValue) mode \(newMode.rawValue), ioBuffer=\(session.ioBufferDuration), preferredSR=\(session.preferredSampleRate)")
         } catch {
             bgLog("Failed to set category: \(error)")
         }
@@ -640,6 +718,11 @@ class AudioManager: ObservableObject {
                 // Reinstall input tap with current format
                 let inputFormat = inputNode.outputFormat(forBus: 0)
                 bgLog("Input format after switch: \(inputFormat.sampleRate)Hz ch=\(inputFormat.channelCount)")
+
+                guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+                    bgLog("ERROR: invalid input format after mode switch — tap not reinstalled")
+                    return
+                }
 
                 // Rebuild converter and input tap for potentially changed format
                 configureInputConverter(for: inputFormat)
@@ -680,8 +763,56 @@ class AudioManager: ObservableObject {
 
         // Ensure the input converter/tap are present after lifecycle transitions.
         let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+            bgLog("WARN: invalid input format in health check (ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate)) — skipping tap")
+            return
+        }
         configureInputConverter(for: inputFormat)
         installInputTapIfNeeded(with: inputFormat)
+    }
+
+    /// Recover RX pipeline when watchdog detects stale input/frame activity.
+    /// This handles cases where old devices keep engine alive but input tap stops delivering.
+    private func recoverRXPipelineIfNeeded(reason: String) {
+        let now = Date()
+        processingBackpressureLock.lock()
+        if let last = lastRxRecoveryDate, now.timeIntervalSince(last) < rxRecoveryCooldown {
+            processingBackpressureLock.unlock()
+            return
+        }
+        lastRxRecoveryDate = now
+        pendingProcessingChunks = 0
+        processingBackpressureLock.unlock()
+
+        appLog("RX watchdog: \(reason) — rebuilding RX pipeline")
+        #if os(iOS)
+        do {
+            try AVAudioSession.sharedInstance().setActive(true)
+        } catch {
+            appLog("RX watchdog: setActive failed: \(error)")
+        }
+        #endif
+
+        if !audioEngine.isRunning {
+            do {
+                try audioEngine.start()
+            } catch {
+                appLog("RX watchdog: engine start failed: \(error)")
+            }
+        }
+
+        let inputFormat = inputNode.outputFormat(forBus: 0)
+        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+            appLog("RX watchdog: invalid input format (ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate))")
+            return
+        }
+
+        removeInputTapIfInstalled()
+        configureInputConverter(for: inputFormat)
+        installInputTapIfNeeded(with: inputFormat)
+        #if os(iOS)
+        applyFixedInputGain()
+        #endif
     }
     
     /// Start a periodic health check timer that runs on a background queue.
@@ -694,6 +825,11 @@ class AudioManager: ObservableObject {
         timer.setEventHandler { [weak self] in
             guard let self = self, self.isRunning else { return }
             let engineRunning = self.audioEngine.isRunning
+            let now = Date()
+            self.processingBackpressureLock.lock()
+            let lastInput = self.lastRxInputCallbackDate
+            let lastFrame = self.lastModemFrameProcessedDate
+            self.processingBackpressureLock.unlock()
             if self.backgroundMode {
                 self.processingBackpressureLock.lock()
                 let pending = self.pendingProcessingChunks
@@ -715,6 +851,19 @@ class AudioManager: ObservableObject {
                 bgLog("Health check: engine NOT running — restarting")
                 self.checkEngineHealth()
             }
+
+            if let lastInput, now.timeIntervalSince(lastInput) > self.rxInputStallThreshold {
+                self.recoverRXPipelineIfNeeded(reason: "no input callback for \(Int(now.timeIntervalSince(lastInput)))s")
+                return
+            }
+
+            let shouldCheckFrameStall = !self.isRealtimeDecodePaused()
+                && !(self.backgroundMode && self.backgroundRawSampleCaptureEnabled)
+            if shouldCheckFrameStall,
+               let lastFrame,
+               now.timeIntervalSince(lastFrame) > self.rxFrameStallThreshold {
+                self.recoverRXPipelineIfNeeded(reason: "no modem frames for \(Int(now.timeIntervalSince(lastFrame)))s")
+            }
         }
         timer.resume()
         healthCheckTimer = timer
@@ -729,18 +878,35 @@ class AudioManager: ObservableObject {
     
     // MARK: - Audio Session Setup
     
+    #if os(iOS)
+    /// Foreground modem decode prefers raw capture (`.measurement`).
+    /// Background execution uses `.default` for better iOS reliability.
+    private func preferredSessionModeForCurrentState() -> AVAudioSession.Mode {
+        return backgroundMode ? .default : .measurement
+    }
+    
+    private func preferredSessionCategoryForCurrentState() -> AVAudioSession.Category {
+        return .playAndRecord
+    }
+    
+    private func preferredSessionOptionsForCurrentState() -> AVAudioSession.CategoryOptions {
+        return [.allowBluetooth, .defaultToSpeaker]
+    }
+    
+    /// Foreground RX isolation mode is fixed on for best decode stability.
+    private func isForegroundRxIsolationEnabled() -> Bool {
+        return !backgroundMode
+    }
+    #endif
+    
     private func setupAudioSession() {
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
         do {
-            try session.setCategory(
-                .playAndRecord,
-                mode: .default,
-                options: [
-                    .allowBluetooth,
-                    .defaultToSpeaker
-                ]
-            )
+            let mode = preferredSessionModeForCurrentState()
+            let category = preferredSessionCategoryForCurrentState()
+            let options = preferredSessionOptionsForCurrentState()
+            try session.setCategory(category, mode: mode, options: options)
             
             // Larger buffer reduces callback frequency and CPU context switches
             // SWL receiver doesn't need ultra-low latency
@@ -786,11 +952,10 @@ class AudioManager: ObservableObject {
                 object: audioEngine
             )
             
-            appLog("Audio session: category=\(session.category.rawValue) mode=\(session.mode.rawValue) sampleRate=\(session.sampleRate) inputGainSettable=\(session.isInputGainSettable) inputGain=\(session.inputGain)")
+            appLog("Audio session: category=\(session.category.rawValue) mode=\(session.mode.rawValue) preferredCategory=\(category.rawValue) preferredMode=\(mode.rawValue) sampleRate=\(session.sampleRate) inputGainSettable=\(session.isInputGainSettable) inputGain=\(session.inputGain)")
             
-            // Verify the category is .playAndRecord — this category overrides the mute switch.
-            if session.category != .playAndRecord {
-                appLog("WARN: category is \(session.category.rawValue), not playAndRecord — mute switch may suppress audio")
+            if session.category != category {
+                appLog("WARN: category is \(session.category.rawValue), expected \(category.rawValue)")
             }
         } catch {
             appLog("Audio session setup failed: \(error)")
@@ -824,7 +989,7 @@ class AudioManager: ObservableObject {
         radeWrapper.onDecodedAudio = { [weak self] samples, count in
             guard let self = self, let samples = samples else { return }
             self.wavRecorder?.writeSamples(samples, count: Int(count))
-            if !self.backgroundMode && !self.deferredReplayFastMode {
+            if !self.backgroundMode && !self.deferredReplayFastMode && !self.isForegroundRxIsolationEnabled() {
                 self.playDecodedAudio(samples: samples, count: Int(count))
             }
         }
@@ -932,6 +1097,13 @@ class AudioManager: ObservableObject {
         // Modem frame processed — detect sync transitions and record snapshots
         radeWrapper.onModemFrameProcessed = { [weak self] snr, freqOffset, syncState, nin in
             guard let self = self else { return }
+            self.processingBackpressureLock.lock()
+            self.lastModemFrameProcessedDate = Date()
+            self.lastKnownSyncState = syncState
+            if syncState == 2 {
+                self.acquisitionBoostUntil = nil
+            }
+            self.processingBackpressureLock.unlock()
             
             let isSynced = syncState == 2
             self.processingBackpressureLock.lock()
@@ -977,7 +1149,6 @@ class AudioManager: ObservableObject {
             // Record high-rate snapshots only in foreground.
             // In background this object stream can cause memory pressure/jetsam.
             if !self.backgroundMode,
-               isSynced,
                let logger = self.receptionLogger,
                let startTime = self.sessionStartTime {
                 let now = Date()
@@ -1081,11 +1252,97 @@ class AudioManager: ObservableObject {
         ) {
             monoFloatFormat = monoFmt
             rxConverter = AVAudioConverter(from: monoFmt, to: modemFormat)
+            updateRxEqCoefficients(sampleRate: Float(inputFormat.sampleRate))
+        }
+    }
+    
+    /// Build a peaking EQ biquad targeting the common mid-band dip on phone mics.
+    private func updateRxEqCoefficients(sampleRate fs: Float) {
+        guard fs > 1000 else { return }
+        rxEqSampleRate = fs
+        
+        let centerHz: Float = 1600
+        let q: Float = 1.15
+        let gainDb = Self.rxEqCompensationGainDb
+        rxEqGainDbApplied = gainDb
+        let a = powf(10, gainDb / 40)
+        let w0 = 2 * Float.pi * centerHz / fs
+        let cosW0 = cosf(w0)
+        let sinW0 = sinf(w0)
+        let alpha = sinW0 / (2 * q)
+        
+        let b0 = 1 + alpha * a
+        let b1 = -2 * cosW0
+        let b2 = 1 - alpha * a
+        let a0 = 1 + alpha / a
+        let a1 = -2 * cosW0
+        let a2 = 1 - alpha / a
+        
+        guard abs(a0) > 1e-9 else { return }
+        rxEqB0 = b0 / a0
+        rxEqB1 = b1 / a0
+        rxEqB2 = b2 / a0
+        rxEqA1 = a1 / a0
+        rxEqA2 = a2 / a0
+        rxEqZ1 = 0
+        rxEqZ2 = 0
+    }
+    
+    private func applyRxEqCompensation(to monoData: UnsafeMutablePointer<Float>, count: Int, sampleRate: Float) {
+        if rxEqSampleRate != sampleRate || abs(rxEqGainDbApplied - Self.rxEqCompensationGainDb) > 0.001 {
+            updateRxEqCoefficients(sampleRate: sampleRate)
+        }
+        guard Self.rxEqCompensationEnabled else { return }
+        
+        var z1 = rxEqZ1
+        var z2 = rxEqZ2
+        let b0 = rxEqB0
+        let b1 = rxEqB1
+        let b2 = rxEqB2
+        let a1 = rxEqA1
+        let a2 = rxEqA2
+        
+        for i in 0..<count {
+            let x = monoData[i]
+            let y = b0 * x + z1
+            z1 = b1 * x - a1 * y + z2
+            z2 = b2 * x - a2 * y
+            monoData[i] = y
+        }
+        
+        rxEqZ1 = z1
+        rxEqZ2 = z2
+    }
+    
+    private func applyRxInputGain(to monoData: UnsafeMutablePointer<Float>, count: Int) {
+        let baseGainDb = Self.rxInputGainDb
+        var boostGainDb: Float = 0
+        processingBackpressureLock.lock()
+        let boostActive = acquisitionBoostUntil.map { Date() < $0 } ?? false
+        if boostActive && lastKnownSyncState != 2 && acquisitionBoostGainDb > 0 {
+            boostGainDb = acquisitionBoostGainDb
+        }
+        processingBackpressureLock.unlock()
+        let gainDb = baseGainDb + boostGainDb
+        if abs(gainDb) < 0.001 { return }
+        let gain = powf(10, gainDb / 20)
+        for i in 0..<count {
+            let y = monoData[i] * gain
+            monoData[i] = max(-1.0, min(1.0, y))
         }
     }
 
     private func installInputTapIfNeeded(with inputFormat: AVAudioFormat) {
         guard !isInputTapInstalled else { return }
+
+        // Validate format — inputNode.outputFormat can return 0 channels / 0 Hz
+        // when the audio session isn't fully ready or the route changed.
+        // installTap throws an unrecoverable NSException if the format is invalid.
+        guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+            appLog("ERROR: invalid input format (ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate)) — skipping tap install")
+            return
+        }
+
         inputNode.installTap(onBus: 0, bufferSize: 960,
                             format: inputFormat) { [weak self] buffer, _ in
             self?.processRXInput(buffer: buffer)
@@ -1102,31 +1359,33 @@ class AudioManager: ObservableObject {
     func startRX() {
         guard !isRunning else { return }
         
-        // Use .default mode for better background compatibility on iOS.
-        // Voice processing is disabled on the input node below.
+        // Foreground: .measurement for raw modem capture.
+        // Background: .default for better iOS background stability.
         resetDeferredFeatures()
         
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
+        let mode = preferredSessionModeForCurrentState()
+        let category = preferredSessionCategoryForCurrentState()
+        let options = preferredSessionOptionsForCurrentState()
         do {
-            try session.setCategory(.playAndRecord, mode: .default,
-                                      options: [.allowBluetooth, .defaultToSpeaker])
+            try session.setCategory(category, mode: mode, options: options)
         } catch {
             appLog("WARN: setCategory failed: \(error) — retrying without bluetooth")
-            try? session.setCategory(.playAndRecord, mode: .default,
-                                      options: [.defaultToSpeaker])
+            try? session.setCategory(category, mode: mode, options: [.defaultToSpeaker])
         }
         do {
             try session.setActive(true)
         } catch {
             appLog("WARN: setActive failed: \(error)")
         }
-        // Verify the category is actually .playAndRecord (overrides mute switch).
-        // If setCategory silently fell back to .soloAmbient, audio won't play when muted.
-        if session.category != .playAndRecord {
-            appLog("WARN: audio session category is \(session.category.rawValue), expected playAndRecord — forcing")
-            try? session.setCategory(.playAndRecord, mode: .default, options: [.defaultToSpeaker])
+        if session.category != category {
+            appLog("WARN: audio session category is \(session.category.rawValue), expected \(category.rawValue) — forcing")
+            try? session.setCategory(category, mode: mode, options: [.defaultToSpeaker])
             try? session.setActive(true)
+        }
+        if session.mode != mode {
+            appLog("WARN: audio session mode is \(session.mode.rawValue), expected \(mode.rawValue)")
         }
         applyFixedInputGain()
         #endif
@@ -1138,13 +1397,14 @@ class AudioManager: ObservableObject {
             print("Failed to disable voice processing: \(error)")
         }
         
-        // Create source node for decoded speech output.
-        // AVAudioSourceNode uses a render callback that the OS invokes every
-        // audio cycle.  This keeps the audio render graph active even when no
-        // decoded speech is available (the callback simply outputs zeros),
-        // which is the proper way to maintain background audio execution.
+        // Always keep a source node attached for stable AVAudioEngine I/O behavior
+        // across device models. Isolation is enforced by suppressing writes into
+        // the playback ring buffer (see onDecodedAudio callback).
         speechRing.reset()
         
+        if isForegroundRxIsolationEnabled() {
+            appLog("RX isolation enabled: decoded-audio writes suppressed")
+        }
         let ring = speechRing  // capture the reference, not self
         let node = AVAudioSourceNode(format: speechFormat) { [weak self] _, _, frameCount, audioBufferList -> OSStatus in
             let ablPointer = UnsafeMutableAudioBufferListPointer(audioBufferList)
@@ -1173,9 +1433,25 @@ class AudioManager: ObservableObject {
         
         // Capture modem signal from mic / audio input
         // inputNode native format is typically 48 kHz with measurement mode
-        let inputFormat = inputNode.outputFormat(forBus: 0)
+        var inputFormat = inputNode.outputFormat(forBus: 0)
         appLog("Audio input format: \(inputFormat)")
         appLog("Input channels: \(inputFormat.channelCount), sampleRate: \(inputFormat.sampleRate)")
+        
+        // Guard against invalid format — can happen when audio route changes or
+        // session isn't fully ready. Re-activate and retry once.
+        if inputFormat.channelCount == 0 || inputFormat.sampleRate == 0 {
+            appLog("WARN: invalid input format — re-activating session and retrying")
+            #if os(iOS)
+            try? AVAudioSession.sharedInstance().setActive(false)
+            try? AVAudioSession.sharedInstance().setActive(true)
+            #endif
+            inputFormat = inputNode.outputFormat(forBus: 0)
+            appLog("Retry input format: ch=\(inputFormat.channelCount) sr=\(inputFormat.sampleRate)")
+            guard inputFormat.channelCount > 0, inputFormat.sampleRate > 0 else {
+                appLog("ERROR: input format still invalid after retry — cannot start RX")
+                return
+            }
+        }
         
         // Set up RX sample rate converter from mono float → 8kHz int16
         // This avoids a complex multi-step conversion (stereo→mono + 48kHz→8kHz + float→int16)
@@ -1188,10 +1464,20 @@ class AudioManager: ObservableObject {
         processingBackpressureLock.lock()
         pendingProcessingChunks = 0
         droppedProcessingChunks = 0
+        lastRxInputCallbackDate = Date()
+        lastModemFrameProcessedDate = Date()
+        lastRxRecoveryDate = nil
+        acquisitionBoostUntil = Date().addingTimeInterval(acquisitionBoostDuration)
+        lastKnownSyncState = 0
+        forceFFTOffForPerformance = false
         backgroundChunkCounter = 0
         isModemSyncedForBackground = false
         backgroundDecodeBoostUntil = nil
         processingBackpressureLock.unlock()
+        appLog("RX acquisition boost enabled for \(Int(acquisitionBoostDuration))s (FFT paused)")
+        DispatchQueue.main.async {
+            self.autoLowLoadModeActive = false
+        }
         deferredSampleStore.reset()
         installInputTapIfNeeded(with: inputFormat)
         
@@ -1232,10 +1518,19 @@ class AudioManager: ObservableObject {
         processingBackpressureLock.lock()
         pendingProcessingChunks = 0
         droppedProcessingChunks = 0
+        lastRxInputCallbackDate = nil
+        lastModemFrameProcessedDate = nil
+        lastRxRecoveryDate = nil
+        acquisitionBoostUntil = nil
+        lastKnownSyncState = 0
+        forceFFTOffForPerformance = false
         backgroundChunkCounter = 0
         isModemSyncedForBackground = false
         backgroundDecodeBoostUntil = nil
         processingBackpressureLock.unlock()
+        DispatchQueue.main.async {
+            self.autoLowLoadModeActive = false
+        }
         if !keepDeferredReplayRunning {
             deferredSampleStore.reset()
             // Ensure deferred replay work has observed cancellation before teardown.
@@ -1311,6 +1606,10 @@ class AudioManager: ObservableObject {
     // MARK: - RX Processing
     
     private func processRXInput(buffer: AVAudioPCMBuffer) {
+        processingBackpressureLock.lock()
+        lastRxInputCallbackDate = Date()
+        processingBackpressureLock.unlock()
+
         guard let converter = rxConverter,
               let monoFmt = monoFloatFormat else { return }
         
@@ -1348,6 +1647,9 @@ class AudioManager: ObservableObject {
         } else {
             return
         }
+        
+        applyRxInputGain(to: monoData, count: inputFrames)
+        applyRxEqCompensation(to: monoData, count: inputFrames, sampleRate: Float(buffer.format.sampleRate))
         
         // Diagnostic: log a few samples from mono buffer on first call
         rxInputCallCount += 1
@@ -1492,8 +1794,21 @@ class AudioManager: ObservableObject {
             shouldEnqueue = true
         } else {
             droppedProcessingChunks += 1
+            let shouldEnableAutoLowLoad = !forceFFTOffForPerformance
+                && droppedProcessingChunks >= autoLowLoadDropThreshold
+                && !backgroundMode
+            if shouldEnableAutoLowLoad {
+                forceFFTOffForPerformance = true
+                fftEnabled = false
+            }
             if droppedProcessingChunks % 100 == 0 {
                 appLog("AudioManager: dropped \(droppedProcessingChunks) RX chunks (backpressure)")
+            }
+            if shouldEnableAutoLowLoad {
+                appLog("AudioManager: auto low-load mode enabled (FFT/waterfall disabled due to RX backpressure)")
+                DispatchQueue.main.async {
+                    self.autoLowLoadModeActive = true
+                }
             }
         }
         processingBackpressureLock.unlock()
@@ -1686,13 +2001,14 @@ class AudioManager: ObservableObject {
                 appLog("Resuming audio engine after interruption")
                 do {
                     let session = AVAudioSession.sharedInstance()
-                    // Re-apply category to ensure .playAndRecord (overrides mute switch)
-                    try session.setCategory(.playAndRecord, mode: .default,
-                                              options: [.allowBluetooth, .defaultToSpeaker])
+                    let mode = preferredSessionModeForCurrentState()
+                    let category = preferredSessionCategoryForCurrentState()
+                    let options = preferredSessionOptionsForCurrentState()
+                    try session.setCategory(category, mode: mode, options: options)
                     try session.setActive(true)
                     try audioEngine.start()
                     applyFixedInputGain()
-                    appLog("Audio engine resumed successfully (category=\(session.category.rawValue))")
+                    appLog("Audio engine resumed successfully (category=\(session.category.rawValue) mode=\(session.mode.rawValue))")
                 } catch {
                     appLog("Failed to resume audio engine: \(error)")
                 }

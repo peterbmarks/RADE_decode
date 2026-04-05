@@ -25,7 +25,7 @@ struct ContentView: View {
                 }
             
             NavigationStack {
-                ReceptionMapView()
+                CombinedMapView(reporter: reporter)
             }
             .tabItem {
                 Label("Map", systemImage: "map")
@@ -53,6 +53,39 @@ struct ContentView: View {
             }
             .interactiveDismissDisabled()
         }
+    }
+}
+
+// MARK: - Combined Map View
+
+struct CombinedMapView: View {
+    var reporter: FreeDVReporter
+    @State private var selectedMap: MapMode = .reception
+
+    enum MapMode: String, CaseIterable {
+        case reception = "Reception"
+        case reporter = "Reporter"
+    }
+
+    var body: some View {
+        ZStack(alignment: .top) {
+            switch selectedMap {
+            case .reception:
+                ReceptionMapView()
+            case .reporter:
+                ReporterMapView(reporter: reporter)
+            }
+
+            Picker("Map", selection: $selectedMap) {
+                ForEach(MapMode.allCases, id: \.self) { mode in
+                    Text(mode.rawValue).tag(mode)
+                }
+            }
+            .pickerStyle(.segmented)
+            .padding(.horizontal, 16)
+            .padding(.top, 8)
+        }
+        .navigationBarHidden(true)
     }
 }
 
@@ -95,7 +128,7 @@ struct OnboardingView: View {
                 
                 Spacer()
                 
-                Text("Swipe to learn more  \(Image(systemName: "chevron.right"))")
+                Text("Swipe to learn more >")
                     .font(.system(size: 14))
                     .foregroundStyle(.tertiary)
                     .padding(.bottom, 50)
@@ -295,7 +328,7 @@ struct OnboardingView: View {
                     Text("Almost there")
                         .font(.system(size: 17, weight: .semibold))
                     
-                    Text("Location is set to **\"While Using\"** only. To keep receiving in the background, go to **Settings \(Image(systemName: "chevron.right")) RADE Decode \(Image(systemName: "chevron.right")) Location** and select **\"Always\"**.")
+                    Text("Location is set to **\"While Using\"** only. To keep receiving in the background, go to **Settings > RADE Decode > Location** and select **\"Always\"**.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                         .multilineTextAlignment(.center)

@@ -26,7 +26,7 @@ class WAVRecorder {
     func writeSamples(_ samples: UnsafePointer<Int16>, count: Int) {
         guard let fh = fileHandle, count > 0 else { return }
         let data = Data(bytes: samples, count: count * MemoryLayout<Int16>.size)
-        fh.write(data)
+        try? fh.write(contentsOf: data)
         totalSamples += UInt32(count)
     }
     
@@ -76,14 +76,14 @@ class WAVRecorder {
         header.append(contentsOf: "data".utf8)
         header.append(uint32: dataSize)
         
-        fh.write(header)
+        try? fh.write(contentsOf: header)
     }
     
     private func writeUInt32(_ value: UInt32) {
         guard let fh = fileHandle else { return }
         var data = Data()
         data.append(uint32: value)
-        fh.write(data)
+        try? fh.write(contentsOf: data)
     }
     
     // MARK: - Directory

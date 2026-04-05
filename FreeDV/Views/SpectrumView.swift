@@ -106,6 +106,7 @@ struct SpectrumView: View {
     
     private func drawGrid(context: GraphicsContext, size: CGSize) {
         let gridFreqs: [CGFloat] = [1000, 2000, 3000]
+        let guideFreqs: [CGFloat] = [750, 1500, 2200]
         let maxFreq: CGFloat = 4000
         
         // Vertical frequency lines
@@ -115,6 +116,15 @@ struct SpectrumView: View {
             path.move(to: CGPoint(x: x, y: 0))
             path.addLine(to: CGPoint(x: x, y: size.height))
             context.stroke(path, with: .color(.white.opacity(0.08)), lineWidth: 0.5)
+        }
+        
+        // Reference guide lines for tuning alignment
+        for freq in guideFreqs {
+            let x = freq / maxFreq * size.width
+            var path = Path()
+            path.move(to: CGPoint(x: x, y: 0))
+            path.addLine(to: CGPoint(x: x, y: size.height))
+            context.stroke(path, with: .color(.yellow.opacity(0.35)), lineWidth: 1.0)
         }
         
         // Horizontal dB lines
