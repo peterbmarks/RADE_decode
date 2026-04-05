@@ -304,9 +304,8 @@ int rade_rx_process(rade_rx_state *rx, float *features_out, float *eoo_out, cons
                                 rx->time_offset, &eoo_quality);
 
             /* Normalized correlation metric: EOO ≈ 2.0, non-EOO ≈ 0.0.
-               Slightly lower threshold improves weak-signal sensitivity.
-               CRC in callsign decode still protects from false positives. */
-            float eoo_thresh = 0.65f;
+               Use a tighter threshold to reduce false EOO triggers. */
+            float eoo_thresh = 0.80f;
             if (eoo_quality > eoo_thresh) {
                 fprintf(stderr, "EOO_Q: quality=%.3f thresh=%.3f\n", eoo_quality, eoo_thresh);
                 int n_eoo_bits = rade_rx_n_eoo_bits(rx);

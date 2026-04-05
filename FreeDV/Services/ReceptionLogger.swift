@@ -30,7 +30,16 @@ class ReceptionLogger {
     private let minSyncedFrames = 4
     
     init(modelContainer: ModelContainer) {
-        self.modelContext = ModelContext(modelContainer)
+        // Keep SwiftData context bound to main queue to avoid queue unbinding warnings.
+        if Thread.isMainThread {
+            self.modelContext = ModelContext(modelContainer)
+        } else {
+            var context: ModelContext?
+            DispatchQueue.main.sync {
+                context = ModelContext(modelContainer)
+            }
+            self.modelContext = context!
+        }
     }
     
     // MARK: - Session Lifecycle
@@ -197,17 +206,25 @@ class ReceptionLogger {
     
     private func persistSession(_ session: ReceptionSession, snapshots: [SignalSnapshot],
                                 syncEvents: [SyncEvent], callsignEvents: [CallsignEvent]) {
-        modelContext.insert(session)
-        for snap in snapshots {
-            modelContext.insert(snap)
+        let saveWork = {
+            self.modelContext.insert(session)
+            for snap in snapshots {
+                self.modelContext.insert(snap)
+            }
+            for event in syncEvents {
+                self.modelContext.insert(event)
+            }
+            for event in callsignEvents {
+                self.modelContext.insert(event)
+            }
+            try? self.modelContext.save()
         }
-        for event in syncEvents {
-            modelContext.insert(event)
+
+        if Thread.isMainThread {
+            saveWork()
+        } else {
+            DispatchQueue.main.sync(execute: saveWork)
         }
-        for event in callsignEvents {
-            modelContext.insert(event)
-        }
-        try? modelContext.save()
     }
     
     private func discardSession() {

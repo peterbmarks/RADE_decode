@@ -266,20 +266,24 @@ class AudioManager: ObservableObject {
     }
     
     /// Configure reception logger with a SwiftData ModelContainer.
-    /// Logger/context are created on processingQueue so all SwiftData access
-    /// stays on the same execution context used by RX processing.
+    /// Logger is created on main queue because SwiftData ModelContext is main-bound.
     func configureLogger(modelContainer: ModelContainer) {
-        processingQueue.sync {
-            guard receptionLogger == nil else { return }
-            receptionLogger = ReceptionLogger(modelContainer: modelContainer)
-        }
+        guard receptionLogger == nil else { return }
+        receptionLogger = ReceptionLogger(modelContainer: modelContainer)
         appLog("ReceptionLogger: configured")
     }
     
     // MARK: - Background Task
 
     func setBackgroundDecodeOnly(_ enabled: Bool) {
-        radeWrapper.speechSynthesisEnabled = !enabled
+        // In foreground RX isolation mode we suppress decoded-audio playback,
+        // so FARGAN synthesis is unnecessary CPU load. Keep it disabled there.
+        #if os(iOS)
+        let shouldSynthesize = !enabled && !isForegroundRxIsolationEnabled()
+        #else
+        let shouldSynthesize = !enabled
+        #endif
+        radeWrapper.speechSynthesisEnabled = shouldSynthesize
     }
 
     func setBackgroundRawSampleCaptureEnabled(_ enabled: Bool) {
@@ -1069,29 +1073,13 @@ class AudioManager: ObservableObject {
 
         // EOO detected regardless of callsign decode success.
         radeWrapper.onEooDetected = { [weak self] callsign in
-            guard let self = self else { return }
-            if callsign != nil { return }
-
-            if self.receptionLogger?.currentSession == nil {
-                let deviceName: String
-                #if os(iOS)
-                deviceName = AVAudioSession.sharedInstance().currentRoute.inputs.first?.portName ?? "Unknown"
-                #else
-                deviceName = "Unknown"
-                #endif
-                self.receptionLogger?.beginSession(audioDevice: deviceName, sampleRate: self.currentSampleRate)
-                self.sessionActive = true
-                self.sessionStartTime = Date()
-                self.pendingSessionEndTime = nil
-                appLog("AudioManager: created EOO-only session")
+            guard self != nil else { return }
+            guard callsign != nil else {
+                // Decode failure is too noisy on weak/old-device paths; do not persist
+                // a pseudo callsign event ("EOO-DETECTED") to avoid false positives.
+                appLog("EOO detected but unresolved; ignored for reception log")
+                return
             }
-
-            let frameCount = self.receptionLogger?.currentSession?.totalModemFrames ?? 0
-            let isDeferredReplay = self.deferredReplayFastMode
-            let lat = isDeferredReplay ? nil : self.locationTracker.latitude
-            let lon = isDeferredReplay ? nil : self.locationTracker.longitude
-            self.receptionLogger?.recordCallsign("EOO-DETECTED", snr: self.snr, modemFrame: frameCount,
-                                                 latitude: lat, longitude: lon)
         }
 
         // Modem frame processed — detect sync transitions and record snapshots

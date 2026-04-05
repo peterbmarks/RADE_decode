@@ -653,9 +653,13 @@ bool EooCallsignDecoder::decode(const float *syms, int symSize,
              + pending[i].imag * pending[i].imag;
     rms = std::sqrt(rms / static_cast<float>(symSize));
 
-    // Guard against zero-amplitude input (no signal → can't decode)
-    if (rms < 1e-10f) {
-        fprintf(stderr, "EOO_DIAG: rms=0 (no signal), symSize=%d\n", symSize);
+    // Guard against very low-amplitude input (effectively noise only).
+    // Below this level, LDPC decode is almost always random and causes
+    // repeated false EOO decode attempts.
+    constexpr float kMinDecodeRms = 0.02f;
+    if (rms < kMinDecodeRms) {
+        fprintf(stderr, "EOO_DIAG: rms=%.4f below gate=%.4f, skip decode (symSize=%d)\n",
+                rms, kMinDecodeRms, symSize);
         return false;
     }
 

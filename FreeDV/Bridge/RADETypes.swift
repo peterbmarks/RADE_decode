@@ -108,6 +108,15 @@ class RADEWrapper {
     private var farganBusy = false
     /// File-backed store for deferred feature synthesis.
     private let deferredFeatureStore = DeferredFeatureStore()
+    /// Dedicated worker for EOO LDPC decode to avoid blocking the main RX loop.
+    private let eooDecodeQueue = DispatchQueue(label: "com.freedv.eooDecode", qos: .utility)
+    private let eooDecodeLock = NSLock()
+    private var eooDecodeInFlight = false
+    private struct EooDecodeResult {
+        let callsign: String?
+        let symbolCount: Int
+    }
+    private var pendingEooResults: [EooDecodeResult] = []
 
     // Callbacks
 
@@ -178,6 +187,12 @@ class RADEWrapper {
 
     /// Diagnostic: count rade_rx calls for periodic logging
     private var rxCallCount = 0
+    /// Require stable sync before allowing expensive EOO decode work.
+    private var consecutiveSyncedFrames = 0
+    /// Cooldown between EOO decode attempts (in modem frames).
+    private var lastEooAttemptFrame = -9999
+    private let minSyncedFramesForEoo = 12         // ~1.4 seconds at ~8.3 fps
+    private let minFramesBetweenEooAttempts = 16   // ~1.9 seconds
 
     /// Process incoming 8kHz mono int16 PCM samples for RX.
     /// Converts real samples to IQ (real part only, imag = 0), feeds to rade_rx(),
@@ -196,6 +211,7 @@ class RADEWrapper {
 
         // Process as many full frames as we have
         while true {
+            flushPendingEooResults()
             let nin = Int(rade_nin(r))
             guard rxInputBuffer.count >= nin else { break }
 
@@ -219,8 +235,10 @@ class RADEWrapper {
             let syncVal = rade_sync(r)
             if syncVal != 0 {
                 status.syncState = .synced
+                consecutiveSyncedFrames += 1
             } else {
                 status.syncState = .searching
+                consecutiveSyncedFrames = 0
             }
             status.snr = Float(rade_snrdB_3k_est(r))
             status.freqOffset = rade_freq_offset(r)
@@ -236,52 +254,51 @@ class RADEWrapper {
                 appLog("RADE RX: sync=\(syncVal) snr=\(status.snr)dB fOff=\(String(format: "%.1f", status.freqOffset))Hz peak=\(String(format: "%.1f", peakDB))dBFS nin=\(nin) feat=\(nFeatOut) buf=\(rxInputBuffer.count)")
             }
 
-            // Check for EOO callsign
+            // Check for EOO callsign (decode asynchronously, callbacks flushed on RX queue)
             if hasEoo != 0 && nEooBits > 0 {
+                let minEooSnrForDecode: Float = 6.0
+                let minEooRmsForDecode: Float = 0.03
+                let canAttemptDecode = status.syncState == .synced
+                    && status.snr >= minEooSnrForDecode
+                    && consecutiveSyncedFrames >= minSyncedFramesForEoo
+                    && (rxCallCount - lastEooAttemptFrame) >= minFramesBetweenEooAttempts
+                if !canAttemptDecode {
+                    continue
+                }
+                lastEooAttemptFrame = rxCallCount
+
                 let totalSymCount = nEooBits / 2
-                var decodedCallsign: String?
-
-                let decoded = eooOut.withUnsafeBufferPointer { eooBuf -> Bool in
-                    guard let base = eooBuf.baseAddress else { return false }
-
-                    // The OFDM demod already equalizes phase per carrier with
-                    // interpolation, so the symbols should be correctly oriented.
-                    // Try with the full symbol count (90) first, then just the
-                    // LDPC portion (56).  QPSK rotation attempts are not useful
-                    // because they permute the bit-to-symbol mapping and the
-                    // LDPC decoder cannot recover from that.
-                    let attempts: [(offset: Int, count: Int)] = [
-                        (0, totalSymCount),
-                        (0, min(totalSymCount, 56))
-                    ]
-
-                    for attempt in attempts {
-                        let floatOffset = attempt.offset * 2
-                        let floatCount = attempt.count * 2
-                        guard floatOffset + floatCount <= eooBuf.count else { continue }
-
-                        var callsignBuf = [CChar](repeating: 0, count: 16)
-                        let ok = callsignBuf.withUnsafeMutableBufferPointer { csBuf in
-                            eoo_callsign_decode(base.advanced(by: floatOffset),
-                                               Int32(attempt.count),
-                                               csBuf.baseAddress,
-                                               Int32(csBuf.count)) != 0
-                        }
-                        if ok {
-                            decodedCallsign = String(cString: callsignBuf)
-                            return true
-                        }
+                let eooRms = eooOut.withUnsafeBufferPointer { eooBuf -> Float in
+                    guard let base = eooBuf.baseAddress else { return 0 }
+                    var sum: Float = 0
+                    for i in 0..<nEooBits {
+                        let v = base[i]
+                        sum += v * v
                     }
-
-                    return false
+                    return sqrt(sum / Float(max(nEooBits, 1)))
+                }
+                if eooRms < minEooRmsForDecode {
+                    continue
                 }
 
-                if decoded {
-                    onCallsignDecoded?(decodedCallsign)
-                } else {
-                    appLog("EOO detected but callsign decode failed (symbols=\(totalSymCount))")
+                var scheduled = false
+                eooDecodeLock.lock()
+                if !eooDecodeInFlight {
+                    eooDecodeInFlight = true
+                    scheduled = true
                 }
-                onEooDetected?(decodedCallsign)
+                eooDecodeLock.unlock()
+                guard scheduled else { continue }
+
+                let symbolCopy = Array(eooOut.prefix(nEooBits))
+                eooDecodeQueue.async { [weak self] in
+                    guard let self = self else { return }
+                    let decoded = self.decodeEooCallsign(symbols: symbolCopy, totalSymCount: totalSymCount)
+                    self.eooDecodeLock.lock()
+                    self.pendingEooResults.append(EooDecodeResult(callsign: decoded, symbolCount: totalSymCount))
+                    self.eooDecodeInFlight = false
+                    self.eooDecodeLock.unlock()
+                }
             }
 
             // Handle decoded feature frames.
@@ -310,6 +327,54 @@ class RADEWrapper {
                         dispatchFargan(frames: frames)
                     }
                 }
+            }
+        }
+        flushPendingEooResults()
+    }
+
+    private func decodeEooCallsign(symbols: [Float], totalSymCount: Int) -> String? {
+        symbols.withUnsafeBufferPointer { eooBuf in
+            guard let base = eooBuf.baseAddress else { return nil }
+
+            let attempts: [(offset: Int, count: Int)] = [
+                (0, totalSymCount),
+                (0, min(totalSymCount, 56))
+            ]
+
+            for attempt in attempts {
+                let floatOffset = attempt.offset * 2
+                let floatCount = attempt.count * 2
+                guard floatOffset + floatCount <= eooBuf.count else { continue }
+
+                var callsignBuf = [CChar](repeating: 0, count: 16)
+                let ok = callsignBuf.withUnsafeMutableBufferPointer { csBuf in
+                    eoo_callsign_decode(base.advanced(by: floatOffset),
+                                       Int32(attempt.count),
+                                       csBuf.baseAddress,
+                                       Int32(csBuf.count)) != 0
+                }
+                if ok {
+                    return String(cString: callsignBuf)
+                }
+            }
+            return nil
+        }
+    }
+
+    private func flushPendingEooResults() {
+        eooDecodeLock.lock()
+        let results = pendingEooResults
+        pendingEooResults.removeAll(keepingCapacity: true)
+        eooDecodeLock.unlock()
+        guard !results.isEmpty else { return }
+
+        for result in results {
+            if let callsign = result.callsign {
+                onCallsignDecoded?(callsign)
+                onEooDetected?(callsign)
+            } else {
+                appLog("EOO detected but callsign decode failed (symbols=\(result.symbolCount))")
+                onEooDetected?(nil)
             }
         }
     }
