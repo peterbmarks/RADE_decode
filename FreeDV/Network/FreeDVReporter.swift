@@ -87,6 +87,7 @@ class FreeDVReporter {
     
     @ObservationIgnored private let serverURL = "wss://qso.freedv.org/socket.io/?EIO=4&transport=websocket"
     @ObservationIgnored private let protocolVersion = 2
+    @ObservationIgnored private var wasSuspendedForBackground = false
     
     // Network monitoring for WiFi ↔ cellular transitions
     @ObservationIgnored private let networkMonitor = NWPathMonitor()
@@ -151,6 +152,8 @@ class FreeDVReporter {
         shouldReconnect = false
         webSocket?.cancel(with: .goingAway, reason: nil)
         webSocket = nil
+        urlSession?.invalidateAndCancel()
+        urlSession = nil
         
         DispatchQueue.main.async {
             self.isConnected = false
@@ -158,6 +161,23 @@ class FreeDVReporter {
             self.stations.removeAll()
         }
         appLog("Reporter: disconnected")
+    }
+
+    // MARK: - App Lifecycle
+
+    /// Called when app enters background to avoid long-lived stale sockets.
+    func suspendForBackground() {
+        guard isEnabled else { return }
+        wasSuspendedForBackground = true
+        disconnect()
+    }
+
+    /// Called when app returns to foreground to restore reporter connection.
+    func resumeFromBackground() {
+        guard wasSuspendedForBackground else { return }
+        wasSuspendedForBackground = false
+        guard isEnabled else { return }
+        connect()
     }
     
     // MARK: - WebSocket Message Loop

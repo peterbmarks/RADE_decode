@@ -4,6 +4,7 @@ import Combine
 
 struct ContentView: View {
     @State private var reporter = FreeDVReporter()
+    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("hasCompletedOnboarding") private var hasCompletedOnboarding = false
     @State private var showOnboarding = false
     
@@ -52,6 +53,18 @@ struct ContentView: View {
                 hasCompletedOnboarding = true
             }
             .interactiveDismissDisabled()
+        }
+        .onChange(of: scenePhase) { _, newPhase in
+            switch newPhase {
+            case .background:
+                reporter.suspendForBackground()
+            case .active:
+                reporter.resumeFromBackground()
+            case .inactive:
+                break
+            @unknown default:
+                break
+            }
         }
     }
 }
