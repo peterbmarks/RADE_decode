@@ -92,30 +92,28 @@ struct SettingsView: View {
             }
             
             // Audio devices section
-            Section("Audio Devices") {
-                HStack {
-                    Text("Input")
-                    Spacer()
-                    Text(deviceManager.currentInputName)
-                        .foregroundStyle(.secondary)
-                }
-                
-                HStack {
-                    Text("Output")
-                    Spacer()
-                    Text(deviceManager.currentOutputName)
-                        .foregroundStyle(.secondary)
-                }
-                
+            Section("Transceiver Audio Devices") {
                 #if os(iOS)
                 if !deviceManager.availableInputs.isEmpty {
-                    NavigationLink("Select Input Device") {
-                        InputDevicePickerView(deviceManager: deviceManager)
+                    if deviceManager.currentInputName == kUnknownAudioDeviceName {
+                        NavigationLink("Select Input Device") {
+                            InputDevicePickerView(deviceManager: deviceManager)
+                        }
+                    } else {
+                        NavigationLink("Input:  " + deviceManager.currentInputName) {
+                            InputDevicePickerView(deviceManager: deviceManager)
+                        }
                     }
                 }
                 if !deviceManager.availableOutputs.isEmpty {
-                    NavigationLink("Select Output Device") {
-                        OutputDevicePickerView(deviceManager: deviceManager)
+                    if deviceManager.currentOutputName == kUnknownAudioDeviceName {
+                        NavigationLink("Select Output Device") {
+                            OutputDevicePickerView(deviceManager: deviceManager)
+                        }
+                    } else {
+                        NavigationLink("Output:  " + deviceManager.currentOutputName) {
+                            OutputDevicePickerView(deviceManager: deviceManager)
+                        }
                     }
                 }
                 #endif

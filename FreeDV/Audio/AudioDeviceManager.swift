@@ -12,11 +12,13 @@ struct OutputDevice: Identifiable {
 }
 #endif
 
+let kUnknownAudioDeviceName: String = "Unknown"
+
 /// Manages iOS audio device enumeration and routing.
 class AudioDeviceManager: ObservableObject {
     
-    @Published var currentInputName: String = "Unknown"
-    @Published var currentOutputName: String = "Unknown"
+    @Published var currentInputName: String = kUnknownAudioDeviceName
+    @Published var currentOutputName: String = kUnknownAudioDeviceName
     
     #if os(iOS)
     @Published var availableInputs: [AVAudioSessionPortDescription] = []
