@@ -72,30 +72,48 @@ class AudioDeviceManager: ObservableObject {
     }
     
     #if os(iOS)
-    /// Build available output device list from current route.
+    /// Build available output device list from the current route and available inputs.
+    /// USB audio devices are paired input+output, so each available USB input
+    /// implies a corresponding output even if it isn't in the active route yet.
     private func buildOutputList(route: AVAudioSessionRouteDescription) {
         var outputs: [OutputDevice] = []
+        var seenUIDs = Set<String>()
         
-        // Add currently routed output as "default"
-        if let current = route.outputs.first {
-            // If current output IS the speaker, don't add it twice
-            if current.portType != .builtInSpeaker {
+        // Add all outputs currently in the route
+        for port in route.outputs {
+            guard !seenUIDs.contains(port.uid) else { continue }
+            seenUIDs.insert(port.uid)
+            outputs.append(OutputDevice(
+                id: port.uid,
+                name: port.portName,
+                portType: port.portType.rawValue,
+                isSpeaker: port.portType == .builtInSpeaker
+            ))
+        }
+        
+        // Add outputs inferred from available USB inputs not already in the route
+        let session = AVAudioSession.sharedInstance()
+        for input in session.availableInputs ?? [] {
+            if input.portType == .usbAudio && !seenUIDs.contains(input.uid) {
+                seenUIDs.insert(input.uid)
                 outputs.append(OutputDevice(
-                    id: "default",
-                    name: current.portName,
-                    portType: current.portType.rawValue,
+                    id: input.uid,
+                    name: input.portName,
+                    portType: input.portType.rawValue,
                     isSpeaker: false
                 ))
             }
         }
         
-        // Always offer built-in speaker
-        outputs.append(OutputDevice(
-            id: "speaker",
-            name: "iPhone Speaker",
-            portType: "Built-in Speaker",
-            isSpeaker: true
-        ))
+        // Always offer built-in speaker if not already listed
+        if !outputs.contains(where: { $0.isSpeaker }) {
+            outputs.append(OutputDevice(
+                id: "speaker",
+                name: "iPhone Speaker",
+                portType: "Built-in Speaker",
+                isSpeaker: true
+            ))
+        }
         
         availableOutputs = outputs
     }
