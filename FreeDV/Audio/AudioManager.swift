@@ -66,7 +66,7 @@ class AudioManager: ObservableObject {
     @Published var deferredDecodeSignalCount: Int = 0
     @Published var autoLowLoadModeActive = false
     
-    // FFT spectrum data (dB magnitude, 512 bins covering 0-4kHz at 8kHz sample rate)
+    // FFT spectrum data (dB magnitude, 512 bins covering 0-3kHz at 8kHz sample rate)
     @Published var fftData: [Float] = Array(repeating: -100, count: 512)
     
     /// When false, FFT computation is skipped to save CPU (power management)
@@ -908,11 +908,11 @@ class AudioManager: ObservableObject {
     }
     
     private func preferredSessionCategoryForCurrentState() -> AVAudioSession.Category {
-        return .playAndRecord
+        return .multiRoute
     }
     
     private func preferredSessionOptionsForCurrentState() -> AVAudioSession.CategoryOptions {
-        return [.allowBluetooth, .defaultToSpeaker]
+        return []
     }
     
     /// Foreground RX isolation mode — disabled so decoded audio plays through
@@ -1378,8 +1378,8 @@ class AudioManager: ObservableObject {
         do {
             try session.setCategory(category, mode: mode, options: options)
         } catch {
-            appLog("WARN: setCategory failed: \(error) — retrying without bluetooth")
-            try? session.setCategory(category, mode: mode, options: [.defaultToSpeaker])
+            appLog("WARN: setCategory failed: \(error) — retrying with no options")
+            try? session.setCategory(category, mode: mode, options: [])
         }
         do {
             try session.setActive(true)
@@ -1388,7 +1388,7 @@ class AudioManager: ObservableObject {
         }
         if session.category != category {
             appLog("WARN: audio session category is \(session.category.rawValue), expected \(category.rawValue) — forcing")
-            try? session.setCategory(category, mode: mode, options: [.defaultToSpeaker])
+            try? session.setCategory(category, mode: mode, options: [])
             try? session.setActive(true)
         }
         if session.mode != mode {
@@ -1495,19 +1495,15 @@ class AudioManager: ObservableObject {
         do {
             try audioEngine.start()
             
-            // Apply user speaker output preference, then re-apply the transceiver
-            // input because overrideOutputAudioPort(.speaker) also changes input
-            // to built-in mic.  Re-setting preferredInput restores the transceiver
-            // input when the two devices are compatible with the route.
-            if AudioManager.userSpeakerOutputId == "speaker" {
-                try? session.overrideOutputAudioPort(.speaker)
-                if let preferred = session.preferredInput {
-                    try? session.setPreferredInput(preferred)
-                    appLog("User speaker → Built-in Speaker, re-applied transceiver input: \(preferred.portName)")
-                } else {
-                    appLog("User speaker → Built-in Speaker")
-                }
-            }
+            // Log multi-route diagnostics
+            #if os(iOS)
+            let route = session.currentRoute
+            let ins = route.inputs.map { "\($0.portName) [\($0.portType.rawValue)]" }.joined(separator: ", ")
+            let outs = route.outputs.map { "\($0.portName) [\($0.portType.rawValue)]" }.joined(separator: ", ")
+            appLog("Route inputs: \(ins)")
+            appLog("Route outputs: \(outs)")
+            appLog("Output node channels: \(self.audioEngine.outputNode.outputFormat(forBus: 0).channelCount), sr: \(self.audioEngine.outputNode.outputFormat(forBus: 0).sampleRate)")
+            #endif
             
             // Start background health check to detect and recover from engine stalls
             startHealthCheckTimer()
