@@ -588,6 +588,7 @@ class AudioManager: ObservableObject {
     }
 
     func resetBackgroundHeartbeat() {
+        // TODO: Hangs on this next line when we press stop
         processingQueue.sync {
             backgroundUpdateCounter = 0
             backgroundHeartbeatCount = 0
@@ -1430,13 +1431,8 @@ class AudioManager: ObservableObject {
             return noErr
         }
         sourceNode = node
-        let speakerMixer = AVAudioMixerNode()
-        speakerOutputNode = speakerMixer
-        
         audioEngine.attach(node)
-        audioEngine.attach(speakerMixer)
-        audioEngine.connect(node, to: speakerMixer, format: speechFormat)
-        audioEngine.connect(speakerMixer, to: audioEngine.mainMixerNode, format: speechFormat)
+        audioEngine.connect(node, to: audioEngine.mainMixerNode, format: speechFormat)
         
         // Capture modem signal from mic / audio input
         // inputNode native format is typically 48 kHz with measurement mode
@@ -1562,14 +1558,10 @@ class AudioManager: ObservableObject {
 
         audioEngine.stop()
         
-        // Detach source and speaker output nodes
+        // Detach source node
         if let node = sourceNode {
             audioEngine.detach(node)
             sourceNode = nil
-        }
-        if let node = speakerOutputNode {
-            audioEngine.detach(node)
-            speakerOutputNode = nil
         }
         
         // Clear speech ring buffer
