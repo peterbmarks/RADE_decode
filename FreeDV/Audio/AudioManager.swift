@@ -1432,15 +1432,11 @@ class AudioManager: ObservableObject {
         sourceNode = node
         let speakerMixer = AVAudioMixerNode()
         speakerOutputNode = speakerMixer
-        let micMixer = AVAudioMixerNode()
-        microphoneInputNode = micMixer
         
         audioEngine.attach(node)
         audioEngine.attach(speakerMixer)
-        audioEngine.attach(micMixer)
         audioEngine.connect(node, to: speakerMixer, format: speechFormat)
         audioEngine.connect(speakerMixer, to: audioEngine.mainMixerNode, format: speechFormat)
-        // microphoneInputNode is attached but not connected (prepared for future TX)
         
         // Capture modem signal from mic / audio input
         // inputNode native format is typically 48 kHz with measurement mode
@@ -1566,7 +1562,7 @@ class AudioManager: ObservableObject {
 
         audioEngine.stop()
         
-        // Detach source and user audio nodes
+        // Detach source and speaker output nodes
         if let node = sourceNode {
             audioEngine.detach(node)
             sourceNode = nil
@@ -1574,10 +1570,6 @@ class AudioManager: ObservableObject {
         if let node = speakerOutputNode {
             audioEngine.detach(node)
             speakerOutputNode = nil
-        }
-        if let node = microphoneInputNode {
-            audioEngine.detach(node)
-            microphoneInputNode = nil
         }
         
         // Clear speech ring buffer
